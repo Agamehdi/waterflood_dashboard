@@ -175,7 +175,7 @@ def safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return numerator.div(denominator.where(denominator > 0)).replace([np.inf, -np.inf], np.nan)
 
 
-def rollup(frame: pd.DataFrame, keys: list[str], netback: float, injection_cost: float) -> pd.DataFrame:
+def rollup(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     """CRITICAL: aggregate numerator/denominator FIRST, then calculate VoW."""
     if frame.empty:
         return pd.DataFrame()
@@ -193,7 +193,6 @@ def rollup(frame: pd.DataFrame, keys: list[str], netback: float, injection_cost:
     result["Liquid"] = result["Oil"].fillna(0) + result["Water"].fillna(0)
     result["Watercut"] = safe_ratio(result["Water"], result["Liquid"])
     result["VoW Technical"] = safe_ratio(result["Supported"], result["Injection"])
-    result["VoW Economic"] = result["VoW Technical"] * netback - injection_cost
     result["Production vs Agreed"] = result["Oil"] - result["Agreed Target"]
     result["Production vs RMT"] = result["Oil"] - result["RMT Target"]
     result["VoW Valid"] = result["Injection"].gt(0) & result["Supported"].notna()
@@ -263,14 +262,13 @@ def scale_volume(x: pd.Series, factor: float, months: float, monthly: bool) -> p
     return x * factor / (months if monthly else 1)
 
 
-def file_download_excel(patterns: pd.DataFrame, cps: pd.DataFrame, detailed: pd.DataFrame, qc: pd.DataFrame, method: str, months: int, share: float, netback: float, injcost: float, exclude_zero: bool) -> bytes:
+def file_download_excel(patterns: pd.DataFrame, cps: pd.DataFrame, detailed: pd.DataFrame, qc: pd.DataFrame, method: str, months: int, share: float, exclude_zero: bool) -> bytes:
     how = "Excel supported oil" if method == "Excel: Oil Supported" else ("Excel support fraction × produced oil" if method == "Excel: Support Fraction" else f"Produced oil × {share:g}%")
     guide = pd.DataFrame([
         ("Scope", f"Uploaded period: {months} months. Raw data are total volumes in stb."),
         ("Oil Supported", how),
         ("Exclude zero-injection supported proxy", f"{exclude_zero}; applies to Produced Oil proxy methods only"),
         ("Technical Value of Water", "Sum(Oil Supported, stb) / Sum(Injected Water, stb)"),
-        ("Economic VoW", f"Technical VoW × oil netback ({netback:g} USD/stb) − injection cost ({injcost:g} USD/stb water)"),
         ("Aggregate VoW", "Ratio of sums, never an average of pattern VoW ratios."),
         ("Zero injection", "VoW is blank / undefined, not zero; retained in QC."),
         ("Interpretation", "Produced oil proxy is NOT demonstrated incremental oil caused by water injection."),
@@ -346,7 +344,7 @@ if df.empty:
     st.stop()
 
 # -----------------------------------------------------------------------------
-# Sidebar controls: global charts / period / support definition / economics.
+# Sidebar controls: global charts / period / support definition.
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Data & calculation")
@@ -376,11 +374,9 @@ with st.sidebar:
         help="When using an observed-oil proxy, a Pattern with zero injection cannot demonstrate contemporaneous injection support. Its production remains in Produced Oil, but is excluded from the Oil Supported proxy. Does not override explicitly uploaded actual supported oil.")
     if method.startswith("Produced Oil"):
         st.caption("⚠️ This is a screening assumption, not a measured incremental waterflood response.")
-    netback = st.number_input("Oil netback (USD/stb oil)", min_value=0.0, max_value=500.0, value=50.0, step=5.0)
-    injcost = st.number_input("Injection variable cost (USD/stb water)", min_value=0.0, max_value=100.0, value=0.0, step=0.25)
-    x_metric = st.selectbox("Cross-plot X metric", ["Technical VoW (stb oil/stb injected)", "Economic VoW (USD/stb injected)"], index=0)
-    x_field = "VoW Technical" if x_metric.startswith("Technical") else "VoW Economic"
-    x_caption = "Value of Water (stb oil supported / stb injected)" if x_field == "VoW Technical" else "Value of Water (USD / stb injected)"
+    # Technical VoW only. Oil netback and economic VoW inputs intentionally omitted.
+    x_field = "VoW Technical"
+    x_caption = "Value of Water (stb oil supported / stb injected)"
     st.divider()
     st.header("Appearance")
     font = st.selectbox("Font", ["Arial", "Aptos", "Calibri", "Inter", "Open Sans", "Verdana"], index=0)
@@ -441,8 +437,8 @@ if filtered.empty:
 work = support_scenario(filtered, method, share)
 if exclude_zero_supported and method.startswith("Produced Oil"):
     work.loc[work["Injection"].isna() | work["Injection"].le(0), "Supported"] = 0.0
-pat = rollup(work, ["Pattern", "CPS", "Reservoir"], netback, injcost)
-cps = rollup(work, ["CPS"], netback, injcost)
+pat = rollup(work, ["Pattern", "CPS", "Reservoir"])
+cps = rollup(work, ["CPS"])
 cps = cps.sort_values("CPS", key=lambda x: x.map(cps_sort)).reset_index(drop=True)
 pat["Oil Display"] = scale_volume(pat["Oil"], factor, n_months, monthly)
 pat["Water Display"] = scale_volume(pat["Water"], factor, n_months, monthly)
@@ -460,7 +456,6 @@ total_water = float(work["Water"].sum())
 total_inj = float(work["Injection"].sum())
 total_supported = float(work["Supported"].sum())
 weighted_vow = total_supported / total_inj if total_inj > 0 else np.nan
-vow_dollars = weighted_vow * netback - injcost if np.isfinite(weighted_vow) else np.nan
 
 # QC over ORIGINAL rows, scoped to selected CPS/reservoir/pattern.
 qc_frames = []
@@ -527,27 +522,69 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Value of Water vs Oil Supported")
-    a, b, c = st.columns([1, 1, 1])
+    a, b, c, d = st.columns(4)
     with a:
         plot_level = st.radio("Aggregation", ["Pattern", "CPS"], horizontal=True, key="cross_level")
     with b:
-        bubble_mode = st.selectbox("Marker sizing", ["Fixed", "Injected Water", "Oil Supported"], key="cross_bubble")
+        color_by = st.selectbox("Color by", ["CPS", "Reservoir", "Pattern"], key="cross_color_by")
     with c:
+        bubble_mode = st.selectbox("Marker sizing", ["Fixed", "Injected Water", "Oil Supported"], key="cross_bubble")
+    with d:
         point_labels = st.selectbox("Point labels", ["Off", "Top 10", "All"], key="cross_labels")
-    col_a, col_b = st.columns(2)
-    with col_a:
+
+    opts_a, opts_b, opts_c = st.columns([1, 1, 1])
+    with opts_a:
         use_quadrants = st.checkbox("Show median-based quadrants", True)
-    with col_b:
+    with opts_b:
         trendline = st.checkbox("Show linear trend line", False)
+    with opts_c:
+        show_category_legend = st.checkbox("Show category legend", value=color_by != "Pattern", key=f"cross_show_legend_{color_by}")
+
+    # Stable colors independent of filtering. CPS retains the editable sidebar colors.
+    palette_name = "Plotly"
+    custom_color = {}
+    if color_by != "CPS":
+        palette_name = st.selectbox("Color palette", ["Plotly", "Safe", "Bold", "Dark24", "Alphabet", "Pastel", "Set3"], key="cross_palette")
+        if color_by == "Reservoir":
+            with st.expander("Reservoir colors (custom)"):
+                for idx, res_name in enumerate(sorted(df["Reservoir"].unique().tolist())):
+                    pcols = getattr(px.colors.qualitative, palette_name)
+                    custom_color[res_name] = st.color_picker(res_name, pcols[idx % len(pcols)], key=f"cross_res_color_{idx}")
+
     custom_title = st.text_input("Cross-plot chart title", "Value of Water vs Oil Supported", key="cross_title")
-    scatter_df = valid_pat.copy() if plot_level == "Pattern" else valid_cps.copy()
+    display_level = plot_level
+    if plot_level == "Pattern":
+        scatter_df = valid_pat.copy()
+    elif color_by == "Reservoir":
+        # One point per CPS / Reservoir, so no potentially mixed-reservoir CPS is
+        # incorrectly painted as belonging to just one reservoir.
+        scatter_df = rollup(work, ["CPS", "Reservoir"])
+        scatter_df["Injection Display"] = scale_volume(scatter_df["Injection"], factor, n_months, monthly)
+        scatter_df["Supported Display"] = scale_volume(scatter_df["Supported"], factor, n_months, monthly)
+        scatter_df = scatter_df.loc[scatter_df["VoW Valid"]].copy()
+        display_level = "CPS × Reservoir"
+        st.caption("Reservoir coloring at CPS level shows one aggregated point per CPS–Reservoir combination, rather than assigning an arbitrary reservoir to the entire CPS.")
+    elif color_by == "Pattern":
+        # A CPS aggregate has no unique Pattern. Keep values at true Pattern
+        # granularity, grouped by selected CPS, instead of assigning false colors.
+        scatter_df = valid_pat.copy()
+        display_level = "Pattern breakdown by CPS"
+        st.info("Color by Pattern requires Pattern-level points. Displaying Pattern breakdown within the selected CPS groups; CPS totals remain available under Color by CPS.")
+    else:
+        scatter_df = valid_cps.copy()
+
     if scatter_df.empty:
         st.info("No records with a positive injected-water volume and a defined Oil Supported value can be plotted. See QC.")
     else:
         scatter_df["x"] = scatter_df[x_field]
         scatter_df["y"] = scatter_df["Supported Display"]
         scatter_df = scatter_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["x", "y"])
-        scatter_df["Point"] = scatter_df["Pattern"] if plot_level == "Pattern" else scatter_df["CPS"]
+        if "Pattern" in scatter_df.columns:
+            scatter_df["Point"] = scatter_df["Pattern"]
+        elif "Reservoir" in scatter_df.columns:
+            scatter_df["Point"] = scatter_df["CPS"] + " · " + scatter_df["Reservoir"]
+        else:
+            scatter_df["Point"] = scatter_df["CPS"]
         scatter_df["Bubble"] = (scatter_df["Injection Display"] if bubble_mode == "Injected Water"
                                 else scatter_df["Supported Display"] if bubble_mode == "Oil Supported"
                                 else pd.Series([1] * len(scatter_df), index=scatter_df.index))
@@ -556,24 +593,39 @@ with tabs[1]:
         scatter_df["Injected Water"] = scatter_df["Injection Display"]
         scatter_df["Oil Supported"] = scatter_df["Supported Display"]
         scatter_df["Technical VoW"] = scatter_df["VoW Technical"]
-        scatter_df["Economic VoW"] = scatter_df["VoW Economic"]
         if scatter_df.empty:
             st.info("No valid numerical points after filtering.")
         else:
+            if color_by == "CPS":
+                color_map = cps_colors
+            elif color_by == "Reservoir":
+                color_map = custom_color
+            else:
+                palette = getattr(px.colors.qualitative, palette_name)
+                # Stable global ordering maintains the same color for a Pattern
+                # after filtering, when a small number of Patterns is selected.
+                patterns_all = sorted(df["Pattern"].dropna().astype(str).unique().tolist())
+                color_map = {name: palette[i % len(palette)] for i, name in enumerate(patterns_all)}
+
+            hover = {"CPS": True, "Injected Water": ":,.2f", "Oil Supported": ":,.2f",
+                     "Technical VoW": ":.4f", "Water cut (%)": ":.1f",
+                     "x": False, "y": False, "Bubble": False}
+            if "Reservoir" in scatter_df.columns:
+                hover["Reservoir"] = True
+            if "Pattern" in scatter_df.columns:
+                hover["Pattern"] = True
+
             fig_sc = px.scatter(
-                scatter_df, x="x", y="y", color="CPS", size="Bubble", size_max=cfg.marker_size,
-                hover_name="Point", color_discrete_map=cps_colors,
-                hover_data={"CPS": True, "Injected Water": ":,.2f", "Oil Supported": ":,.2f",
-                            "Technical VoW": ":.4f", "Economic VoW": ":.2f",
-                            "Water cut (%)": ":.1f", "x": False, "y": False, "Bubble": False},
-                category_orders={"CPS": sorted(scatter_df["CPS"].unique(), key=cps_sort)},
+                scatter_df, x="x", y="y", color=color_by, size="Bubble", size_max=cfg.marker_size,
+                hover_name="Point", color_discrete_map=color_map, hover_data=hover,
+                category_orders={"CPS": sorted(df["CPS"].unique(), key=cps_sort)},
             )
             fig_sc.update_traces(marker=dict(opacity=cfg.opacity, line=dict(width=max(0.5, cfg.line_width / 2), color=cfg.paper)))
             if use_quadrants and len(scatter_df) > 1:
                 mid_x, mid_y = float(scatter_df["x"].median()), float(scatter_df["y"].median())
                 fig_sc.add_vline(x=mid_x, line_dash="dash", line_color="#8793A4", line_width=cfg.line_width)
                 fig_sc.add_hline(y=mid_y, line_dash="dash", line_color="#8793A4", line_width=cfg.line_width)
-                st.caption(f"Quadrants are split at the filtered {plot_level.lower()} median: VoW = {mid_x:,.3f}; Oil Supported = {mid_y:,.2f} {period_label}.")
+                st.caption(f"Quadrants use the selected {display_level.lower()} median: VoW = {mid_x:,.3f}; Oil Supported = {mid_y:,.2f} {period_label}.")
             if trendline and len(scatter_df) >= 3 and scatter_df["x"].nunique() > 1:
                 slope, offset = np.polyfit(scatter_df["x"], scatter_df["y"], 1)
                 xs = np.linspace(scatter_df["x"].min(), scatter_df["x"].max(), 100)
@@ -584,7 +636,7 @@ with tabs[1]:
                 fig_sc.add_trace(go.Scatter(x=to_label["x"], y=to_label["y"], mode="text", text=to_label["Point"],
                                              textposition="top center", textfont=dict(size=max(9, cfg.tick_size - 1), color=cfg.text),
                                              showlegend=False, hoverinfo="skip", cliponaxis=False))
-            apply_style(fig_sc, cfg, f"{custom_title} — {plot_level}", x_caption, f"Oil Supported ({period_label})")
+            apply_style(fig_sc, cfg, f"{custom_title} — {display_level}", x_caption, f"Oil Supported ({period_label})", show_legend=show_category_legend)
             if st.checkbox("Set manual X/Y axis ranges", False, key="manual_scatter_axes"):
                 min_x, max_x = float(scatter_df["x"].min()), float(scatter_df["x"].max())
                 min_y, max_y = float(scatter_df["y"].min()), float(scatter_df["y"].max())
@@ -603,15 +655,15 @@ with tabs[1]:
                     fig_sc.update_yaxes(range=[lo_y, hi_y])
                 else:
                     st.warning("Axis maximum must be greater than minimum.")
-            plot(fig_sc, f"vow_scatter_{plot_level.lower()}")
+            plot(fig_sc, f"vow_scatter_{plot_level.lower()}_{color_by.lower()}")
             st.download_button("Download cross-plot as interactive HTML", fig_sc.to_html(full_html=True, include_plotlyjs=True).encode("utf-8"),
-                               file_name=f"VoW_vs_OilSupported_{plot_level}.html", mime="text/html", key="html_cross")
+                               file_name=f"VoW_vs_OilSupported_{plot_level}_ColorBy_{color_by}.html", mime="text/html", key="html_cross")
             # True weighted aggregation: sum(supported) / sum(injected). Not average of ratios.
             st.caption("Pattern and CPS VoW are recalculated from the respective **sum of supported oil / sum of injection**. Unit and monthly-average switches do not alter this technical ratio.")
 
 with tabs[2]:
     st.subheader("Pattern-by-Pattern ranking")
-    rank_measure = st.selectbox("Rank Patterns by", ["VoW Technical", "VoW Economic", "Supported Display", "Injection Display", "Oil Display", "Watercut"], key="rank_measure")
+    rank_measure = st.selectbox("Rank Patterns by", ["VoW Technical", "Supported Display", "Injection Display", "Oil Display", "Watercut"], key="rank_measure")
     rank_max = max(1, min(len(pat), 200))
     num_to_show = st.slider("Number of Patterns in chart", 1 if rank_max < 5 else 5, rank_max, min(len(pat), 30), key="rank_n")
     minimum_inj = st.number_input("Minimum injected volume (stb / original full period)", min_value=0.0, value=0.0, step=5_000.0, key="rank_min_inj")
@@ -625,7 +677,7 @@ with tabs[2]:
                                  customdata=ranked_n[["CPS", "Oil Display", "Injection Display"]].fillna(0).to_numpy(),
                                  hovertemplate="%{y}<br>Score: %{x:,.3f}<br>CPS: %{customdata[0]}<br>Oil: %{customdata[1]:,.1f}<br>Injection: %{customdata[2]:,.1f}<extra></extra>"))
         bar_height = max(470, min(1900, int(num_to_show * 28 + 180)))
-        labels = {"VoW Technical": "stb supported oil / stb injected", "VoW Economic": "USD / stb injected",
+        labels = {"VoW Technical": "stb supported oil / stb injected",
                   "Supported Display": f"Oil Supported ({period_label})", "Injection Display": f"Injection ({period_label})",
                   "Oil Display": f"Oil ({period_label})", "Watercut": "Produced-water fraction"}
         apply_style(chart, cfg, f"Top Patterns ranked by {rank_measure}", labels[rank_measure], "Pattern", show_legend=False, height=bar_height)
@@ -633,7 +685,7 @@ with tabs[2]:
         plot(chart, "pattern_ranking_bar")
     else:
         st.info("No Patterns satisfy the chosen injected-volume threshold.")
-    table = ranking[["Rank", "Pattern", "CPS", "Reservoir", "VoW Technical", "VoW Economic",
+    table = ranking[["Rank", "Pattern", "CPS", "Reservoir", "VoW Technical",
                      "Supported Display", "Oil Display", "Water Display", "Injection Display", "Watercut", "VRR", "Res Pressure", "FBHP Trend"]].copy()
     table = table.rename(columns={"Supported Display": f"Supported ({period_label})", "Oil Display": f"Oil ({period_label})",
                                   "Water Display": f"Produced Water ({period_label})", "Injection Display": f"Injected Water ({period_label})",
@@ -643,7 +695,7 @@ with tabs[2]:
 
 with tabs[3]:
     st.subheader("CPS ranking & allocation")
-    cps_rank_measure = st.selectbox("CPS score", ["VoW Technical", "VoW Economic", "Supported Display", "Injection Display"], key="cps_rank_metric")
+    cps_rank_measure = st.selectbox("CPS score", ["VoW Technical", "Supported Display", "Injection Display"], key="cps_rank_metric")
     rank_cps = valid_cps.sort_values(cps_rank_measure, ascending=False).reset_index(drop=True)
     if not rank_cps.empty:
         rank_cps.insert(0, "Rank", np.arange(1, len(rank_cps) + 1))
@@ -653,7 +705,7 @@ with tabs[3]:
                                    text=order[cps_rank_measure].map(lambda v: f"{v:,.3f}" if pd.notna(v) else ""), textposition="outside"))
         apply_style(cps_fig, cfg, "CPS ranking — weighted by injected water", cps_rank_measure, "CPS", show_legend=False, height=460)
         plot(cps_fig, "cps_ranking")
-        cpstable = rank_cps[["Rank", "CPS", "Patterns", "VoW Technical", "VoW Economic", "Supported Display",
+        cpstable = rank_cps[["Rank", "CPS", "Patterns", "VoW Technical", "Supported Display",
                              "Oil Display", "Water Display", "Injection Display", "Watercut", "VRR"]].copy()
         cpstable = cpstable.rename(columns={"Supported Display": f"Supported ({period_label})", "Oil Display": f"Oil ({period_label})",
                                              "Water Display": f"Water ({period_label})", "Injection Display": f"Injection ({period_label})",
@@ -700,7 +752,6 @@ with tabs[4]:
     st.markdown("**Custom cross-plot lab**")
     available = {
         "Technical VoW": ("VoW Technical", "stb/stb"),
-        "Economic VoW": ("VoW Economic", "USD/stb injected"),
         "Produced Oil": ("Oil Display", period_label),
         "Oil Supported": ("Supported Display", period_label),
         "Produced Water": ("Water Display", period_label),
@@ -715,9 +766,9 @@ with tabs[4]:
     }
     cx, cy, clev = st.columns([1, 1, 1])
     with cx:
-        x_custom = st.selectbox("X variable", list(available), index=5)
+        x_custom = st.selectbox("X variable", list(available), index=4)
     with cy:
-        y_custom = st.selectbox("Y variable", list(available), index=3)
+        y_custom = st.selectbox("Y variable", list(available), index=2)
     with clev:
         custom_level = st.selectbox("Grouping", ["Pattern", "CPS"], key="custom_level")
     lab_data = (pat if custom_level == "Pattern" else cps).copy()
@@ -755,20 +806,17 @@ with tabs[5]:
     st.markdown("**2. Calculate technical Value of Water (VoW).**")
     st.latex(r"\mathrm{VoW}_{\mathrm{technical}}=\frac{\sum Q_{o,\mathrm{supported}}\ [\mathrm{stb}]}{\sum W_{\mathrm{inj}}\ [\mathrm{stb}]}\ \ [\mathrm{stb\ oil/stb\ injected\ water}]")
     st.markdown("This ratio is an injection-allocation **screening metric**, not proof of incremental recovery. It is undefined when injected volume is zero.")
-    st.markdown("**3. Optional economic Value of Water (VoW).**")
-    st.latex(r"\mathrm{VoW}_{\mathrm{economic}}=\mathrm{VoW}_{\mathrm{technical}}\times N_{\mathrm{oil}}-C_{\mathrm{inj}}\quad [\mathrm{USD/stb\ injected}]")
-    st.markdown(f"Currently: oil netback **{netback:g} USD/stb oil**, variable injection cost **{injcost:g} USD/stb water**. This excludes fixed costs, development costs, time lags, and discounting.")
-    st.markdown("**4. Roll up to CPS properly.**")
+    st.markdown("**3. Roll up to CPS properly.**")
     st.latex(r"\mathrm{VoW}_{\mathrm{CPS}}=\frac{\sum_{p\in\mathrm{CPS}} Q_{o,\mathrm{supported},p}}{\sum_{p\in\mathrm{CPS}} W_{\mathrm{inj},p}}")
     st.markdown("**Do not average the Pattern VoW ratios directly.** Summing volumes first avoids bias toward low-injection Patterns.")
-    st.markdown("**5. Total versus monthly average.**")
+    st.markdown("**4. Total versus monthly average.**")
     st.latex(r"Q_{\mathrm{avg/month}}=\frac{Q_{\mathrm{total\ period}}}{N_{\mathrm{months}}},\qquad\frac{Q_{o}/N}{W_{\mathrm{inj}}/N}=\frac{Q_o}{W_{\mathrm{inj}}}")
     st.markdown("Unit conversions are applied equally to oil and water; changing volume display units or averaging per month must **not** change technical VoW.")
-    st.markdown("**6. Watercut and VRR.** Watercut is recomputed as produced water / (produced oil + produced water). Reported VRR is read from the workbook. Reservoir-corrected VRR requires FVF and full reservoir voidage terms, so we do **not** fabricate CPS reservoir VRR from stock-tank volumes.")
+    st.markdown("**5. Watercut and VRR.** Watercut is recomputed as produced water / (produced oil + produced water). Reported VRR is read from the workbook. Reservoir-corrected VRR requires FVF and full reservoir voidage terms, so we do **not** fabricate CPS reservoir VRR from stock-tank volumes.")
     if not valid_pat.empty:
         sample = valid_pat.iloc[0]
         st.markdown("**Worked example from the current filters:**")
-        st.code(f"Pattern: {sample['Pattern']}\nOil Supported: {sample['Supported']:,.1f} stb\nWater Injection: {sample['Injection']:,.1f} stb\nTechnical VoW = {sample['Supported']:,.1f} / {sample['Injection']:,.1f} = {sample['VoW Technical']:.4f} stb/stb\nEconomic VoW = {sample['VoW Technical']:.4f} × {netback:.2f} − {injcost:.2f} = {sample['VoW Economic']:.2f} USD/stb", language="text")
+        st.code(f"Pattern: {sample['Pattern']}\nOil Supported: {sample['Supported']:,.1f} stb\nWater Injection: {sample['Injection']:,.1f} stb\nTechnical VoW = {sample['Supported']:,.1f} / {sample['Injection']:,.1f} = {sample['VoW Technical']:.4f} stb/stb", language="text")
     st.markdown("**Limitations:** contemporaneous production/injection correlation cannot establish causation; lagged response, injector-producer allocation factors, underlying decline, pressure support, reservoir connectivity, and water cycling must be evaluated before making injection-rate decisions.")
     st.markdown("Useful technical background: [SPE — Mature Flood Surveillance Using Streamlines](https://jpt.spe.org/mature-flood-surveillance-using-streamlines) and [SPE — Role of Surveillance Plots in Diagnosing Waterfloods](https://jpt.spe.org/twa/role-surveillance-plots-diagnosing-waterfloods).")
 
@@ -790,7 +838,7 @@ with ex2:
                        file_name="CPS_VoW_Ranking.csv", mime="text/csv", use_container_width=True)
 with ex3:
     try:
-        xlsx_bytes = file_download_excel(pattern_export, cps_export, work, qc_table, method, n_months, share, netback, injcost, exclude_zero_supported)
+        xlsx_bytes = file_download_excel(pattern_export, cps_export, work, qc_table, method, n_months, share, exclude_zero_supported)
         st.download_button("Download Full Excel + QC + Guideline", xlsx_bytes,
                            file_name="Pattern_Waterflood_VoW_Analysis.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
