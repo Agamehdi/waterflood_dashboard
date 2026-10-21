@@ -351,6 +351,43 @@ def standardise(raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str], dict[str, s
     return df.reset_index(drop=True), [], {k: v for k, v in matched.items() if v}
 
 
+BP_ANALYTICAL_METHOD = "BP Analytical (fluid balance)"
+DEFAULT_BO = {"Mishrif": 1.25, "Main Pay": 1.43, "Upper Shale": 1.36}
+
+
+def analytical_waterflood(frame: pd.DataFrame, bo_by_reservoir: dict[str, float],
+                          bwi: float = 1.0, bwp: float = 1.0,
+                          delta_gor: float = 0.0, bg: float = 0.005) -> pd.DataFrame:
+    """BP material-balance, ideal-displacement/constant-pressure limit (slide eq. 10/11).
+
+    VoW_BP = Bwi*Qo / (Qo*Bo + Qw*Bwp + Qg*Bg)
+           = Bwi / (Bo + WC/(1-WC)*Bwp + delta_gor*Bg).
+    Qo,Qw are period stock-tank stb; Qg=delta_gor*Qo scf, Bg rb/scf.
+    Returned 'BP Supported' is an *ideal-model equivalent*, NOT observed incremental oil.
+    An injection-weighted rollup uses SUM(BP Supported)/SUM(Injection).
+    """
+    out = frame.copy()
+    out["Bo"] = out["Reservoir"].map(bo_by_reservoir)
+    oi = pd.to_numeric(out["Oil"], errors="coerce")
+    wa = pd.to_numeric(out["Water"], errors="coerce")
+    inj = pd.to_numeric(out["Injection"], errors="coerce")
+    bo = pd.to_numeric(out["Bo"], errors="coerce")
+    gas_reservoir_volume = oi * float(delta_gor) * float(bg)
+    total_reservoir_offtake = oi * bo + wa * float(bwp) + gas_reservoir_volume
+    valid = (oi.notna() & wa.notna() & bo.notna() &
+             oi.ge(0) & wa.ge(0) & bo.gt(0) & total_reservoir_offtake.gt(0))
+    analytical = pd.Series(np.nan, index=out.index, dtype=float)
+    analytical.loc[valid] = (float(bwi) * oi.loc[valid] /
+                              total_reservoir_offtake.loc[valid])
+    # For oil-free water production and positive total off-take the equation returns 0.
+    out["BP VoW (raw)"] = analytical
+    out["BP Offtake (rb)"] = total_reservoir_offtake.where(valid)
+    out["BP Oil Supported (stb)"] = (analytical * inj).where(inj.gt(0))
+    out["BP Oil Supported (stb)"] = out["BP Oil Supported (stb)"].where(~inj.eq(0), 0.0)
+    out["BP Gas Term (rb)"] = gas_reservoir_volume
+    return out
+
+
 def support_scenario(frame: pd.DataFrame, method: str, share: float) -> pd.DataFrame:
     df = frame.copy()
     if method == "Excel: Oil Supported":
@@ -371,6 +408,11 @@ def rollup(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame()
     sum_cols = ["Oil", "Water", "Injection", "Supported", "Agreed Target", "RMT Target"]
+    # Keep analytical prediction as a separate non-averaged numerator at all levels.
+    if "BP Oil Supported (stb)" in frame.columns:
+        sum_cols += ["BP Oil Supported (stb)"]
+    if "Existing Supported" in frame.columns:
+        sum_cols += ["Existing Supported"]
     aggs: dict[str, object] = {c: (lambda x: x.sum(min_count=1)) for c in sum_cols}
     for col in ("VRR", "Res Pressure", "Psat", "Delta P", "FBHP Trend"):
         aggs[col] = "mean"  # Informational only; NOT a recomputed reservoir-condition VRR.
@@ -384,6 +426,10 @@ def rollup(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
     result["Liquid"] = result["Oil"].fillna(0) + result["Water"].fillna(0)
     result["Watercut"] = safe_ratio(result["Water"], result["Liquid"])
     result["VoW Technical"] = safe_ratio(result["Supported"], result["Injection"])
+    if "BP Oil Supported (stb)" in result:
+        result["BP VoW (raw)"] = safe_ratio(result["BP Oil Supported (stb)"], result["Injection"])
+    if "Existing Supported" in result:
+        result["Existing VoW (raw)"] = safe_ratio(result["Existing Supported"], result["Injection"])
     # Raw ratio is kept for engineering QC; 0–1 score added later for charts.
     result["Production vs Agreed"] = result["Oil"] - result["Agreed Target"]
     result["Production vs RMT"] = result["Oil"] - result["RMT Target"]
@@ -454,11 +500,23 @@ def scale_volume(x: pd.Series, factor: float, months: float, monthly: bool) -> p
     return x * factor / (months if monthly else 1)
 
 
-def file_download_excel(patterns: pd.DataFrame, cps: pd.DataFrame, manifold: pd.DataFrame, detailed: pd.DataFrame, qc: pd.DataFrame, method: str, months: int, days: int, share: float, exclude_zero: bool, norm_references: dict[str, float]) -> bytes:
-    how = "Excel supported oil" if method == "Excel: Oil Supported" else ("Excel support fraction × produced oil" if method == "Excel: Support Fraction" else f"Produced oil × {share:g}%")
+def file_download_excel(patterns: pd.DataFrame, cps: pd.DataFrame, manifold: pd.DataFrame, detailed: pd.DataFrame, qc: pd.DataFrame, method: str, months: int, days: int, share: float, exclude_zero: bool, norm_references: dict[str, float], bo_by_reservoir: dict[str, float], bwi: float, bwp: float, delta_gor: float, bg: float) -> bytes:
+    how = ("BP Analytical — FVF-based material balance" if method == BP_ANALYTICAL_METHOD else
+           ("Excel supported oil" if method == "Excel: Oil Supported" else
+            ("Excel support fraction × produced oil" if method == "Excel: Support Fraction" else f"Produced oil × {share:g}%")))
     guide = pd.DataFrame([
         ("Scope", f"Uploaded period: {months} months. Raw data are total volumes in stb."),
         ("Oil Supported", how),
+        ("Selected method", method),
+        ("BP slide Eq. 10", "VoW_BP = Bwi*Qo / (Bo*Qo + Bwp*Qw + Bg*Qg), volumes matched over reporting period."),
+        ("BP slide Eq. 11", "VoW_BP = Bwi/(Bo + Bwp*WC/(1-WC) + Bg*(Rp-Rs))."),
+        ("BP analytical support", "Model-equivalent Oil Supported = VoW_BP * actual injected water. Not measured incremental oil."),
+        ("BP assumptions", "Ideal displacement; constant pressure; no aquifer/gas injection/expansion in simplified Eq. 10/11."),
+        ("Bwi injected water FVF (rb/stb)", f"{bwi:.6f}"),
+        ("Bwp produced water FVF (rb/stb)", f"{bwp:.6f}"),
+        ("Gas ratio Rp-Rs (scf/stb)", f"{delta_gor:.6f}"),
+        ("Bg gas FVF (rb/scf)", f"{bg:.8f}"),
+        *[(f"Bo {k} (rb/stb)", f"{v:.6f}") for k, v in bo_by_reservoir.items()],
         ("Exclude zero-injection supported proxy", f"{exclude_zero}; applies to Produced Oil proxy methods only"),
         ("Raw Value of Water", "Sum(Oil Supported, stb) / Sum(Injected Water, stb), can exceed 1."),
         ("Normalized VoW (0–1)", "Raw group VoW / maximum raw VoW WITHIN THAT GROUPING LEVEL. Pattern, CPS and Manifold have separate references. Recomputed when filters change."),
@@ -632,11 +690,12 @@ with st.sidebar:
         period_label = "mbd (thousand stb/day)"
     st.caption("**mbd** = thousand stock-tank barrels per day (Mstb/d). Enter exact period days for accurate daily rates.")
     support_methods = ["Produced Oil (screening proxy)", "Produced Oil × manual support %"]
+    support_methods.append(BP_ANALYTICAL_METHOD)
     if df["Actual Supported Oil"].notna().any():
         support_methods.insert(0, "Excel: Oil Supported")
     if df["Support Fraction"].notna().any():
         support_methods.insert(0, "Excel: Support Fraction")
-    method = st.selectbox("Oil Supported definition", support_methods,
+    method = st.selectbox("Value of Water / Oil Supported method", support_methods,
                           index=support_methods.index("Produced Oil (screening proxy)"),
                           help="Actual waterflood-supported / incremental oil is not present in the October upload; Produced Oil is only a screening proxy.")
     share = 100.0
@@ -648,6 +707,37 @@ with st.sidebar:
         help="When using an observed-oil proxy, a Pattern with zero injection cannot demonstrate contemporaneous injection support. Its production remains in Produced Oil, but is excluded from the Oil Supported proxy. Does not override explicitly uploaded actual supported oil.")
     if method.startswith("Produced Oil"):
         st.caption("⚠️ This is a screening assumption, not a measured incremental waterflood response.")
+    # BP's presented Eq. 10 / 11 uses reservoir-condition material balance.
+    # Controls are always visible, so comparison tab and export work for BOTH methods.
+    with st.expander("BP Analytical VoW — reservoir FVF inputs", expanded=method == BP_ANALYTICAL_METHOD):
+        st.caption("Oil FVF Bo (rb/stb). Each reservoir is treated separately at Pattern level.")
+        bo_by_reservoir = {}
+        for reservoir in sorted(df["Reservoir"].dropna().unique().tolist()):
+            bo_by_reservoir[reservoir] = st.number_input(
+                f"{reservoir} — Bo (rb/stb)", min_value=0.01, max_value=5.0,
+                value=float(DEFAULT_BO.get(reservoir, 1.00)), step=0.01, format="%.3f",
+                key=f"bp_bo_{keyify(reservoir)}",
+            )
+        bp_bwi = st.number_input("Bwi — injected-water FVF (rb/stb)",
+                                 min_value=0.01, max_value=3.0, value=1.0, step=0.01, format="%.3f",
+                                 key="bp_bwi")
+        bp_bwp = st.number_input("Bwp — produced-water FVF (rb/stb)",
+                                 min_value=0.01, max_value=3.0, value=1.0, step=0.01, format="%.3f",
+                                 key="bp_bwp")
+        include_gas = st.checkbox("Include produced-gas reservoir volume", value=False,
+                                  help="Enable only with defensible produced-gas data or Rp−Rs estimate.", key="bp_gas_enabled")
+        if include_gas:
+            bp_delta_gor = st.number_input("(Rp − Rs) (scf/stb)", min_value=0.0,
+                                            max_value=50000.0, value=0.0, step=10.0, key="bp_delta_gor")
+            bp_bg = st.number_input("Bg (rb/scf)", min_value=0.0, max_value=10.0,
+                                     value=0.005, step=0.001, format="%.5f", key="bp_bg")
+        else:
+            bp_delta_gor, bp_bg = 0.0, 0.005
+        if any(r not in DEFAULT_BO for r in bo_by_reservoir):
+            st.warning("An unrecognised Reservoir was found. Its Bo starts at 1.00, not a Mishrif assumption. Enter an appropriate reservoir-specific Bo.")
+        st.caption("Default: ideal displacement; constant reservoir pressure; Bwi=Bwp=1.0. "
+                   "Produced gas term off unless explicitly enabled. BP prediction is not a measurement "
+                   "of incremental production. Actual reported injection is used to calculate equivalent Oil Supported.")
     # Display a relative 0–1 VoW score, preserving raw VoW in source data and tooltips.
     x_field = "VoW Normalized"
     x_caption = "Value of Water (normalised 0–1)"
@@ -708,9 +798,17 @@ if filtered.empty:
     st.warning("Current filters return no Pattern records. Adjust the sidebar selections.")
     st.stop()
 
+# Always calculate the BP benchmark even when keeping the pre-existing method.
 work = support_scenario(filtered, method, share)
 if exclude_zero_supported and method.startswith("Produced Oil"):
     work.loc[work["Injection"].isna() | work["Injection"].le(0), "Supported"] = 0.0
+work["Existing Supported"] = work["Supported"].copy()
+if method == BP_ANALYTICAL_METHOD and exclude_zero_supported:
+    # Compare against the same zero-injection-excluded produced-oil baseline.
+    work.loc[work["Injection"].isna() | work["Injection"].le(0), "Existing Supported"] = 0.0
+work = analytical_waterflood(work, bo_by_reservoir, bp_bwi, bp_bwp, bp_delta_gor, bp_bg)
+if method == BP_ANALYTICAL_METHOD:
+    work["Supported"] = work["BP Oil Supported (stb)"]
 pat = attach_display(rollup(work, ["Pattern", "CPS", "Reservoir", "Manifold"]), factor, n_months, period, n_days)
 cps = attach_display(rollup(work, ["CPS"]), factor, n_months, period, n_days)
 cps = cps.sort_values("CPS", key=lambda x: x.map(cps_sort)).reset_index(drop=True)
@@ -747,6 +845,8 @@ for condition, text_label in [
     (filtered["Manifold"].eq("Unmapped"), "Manifold assignment missing — excluded from Manifold aggregation"),
     (filtered["Manifold CPS mismatch"], "Pattern CPS and Manifold CPS differ — Manifold value used for Manifold rollup; verify assignment"),
     (work["Injection"].gt(0) & work["Supported"].gt(2 * work["Injection"]), "VoW > 2 — review context; mathematically possible"),
+    (work["Injection"].gt(0) & work["BP Oil Supported (stb)"].isna(), "BP analytical input unavailable / no produced-fluid offtake"),
+    (work["BP Oil Supported (stb)"].gt(work["Oil"] * 1.001), "BP ideal equivalent supported volume exceeds measured oil; check assumptions / allocations"),
     (filtered["Injection"].isna(), "Missing injected volume"),
     (filtered["Oil"].isna(), "Missing produced oil volume"),
     (filtered["Water"].isna(), "Missing produced water volume"),
@@ -762,6 +862,8 @@ qc_table = pd.concat(qc_frames, ignore_index=True) if qc_frames else pd.DataFram
 
 # Top summary, intentionally independent of tab selection to avoid empty overview after navigation.
 st.caption(f"{len(filtered):,} source rows · {len(pat):,} Patterns · {len(cps):,} CPS groups · {len(valid_manifold):,} valid Manifold groups · {n_days} period days · Manifold IDs from source Excel")
+st.caption(f"**VoW method:** {'BP Analytical — ideal material-balance estimate' if method == BP_ANALYTICAL_METHOD else method}. "
+           "Relative 0–1 normalisation is performed separately for Pattern, CPS and Manifold.")
 met1, met2, met3, met4, met5 = st.columns(5)
 met1.metric(f"Produced Oil ({period_label})", pretty(float(display_volume(pd.Series([total_oil]), factor, n_months, period, n_days).iloc[0]), 1))
 met2.metric(f"Produced Water ({period_label})", pretty(float(display_volume(pd.Series([total_water]), factor, n_months, period, n_days).iloc[0]), 1))
@@ -776,11 +878,15 @@ st.caption(
 )
 if method.startswith("Produced Oil"):
     st.warning("**Interpretation:** Oil Supported is an assumption based on Produced Oil, not measured incremental oil attributable to injection. Use an actual supported-oil column for defensible causal Value of Water.", icon="⚠️")
+elif method == BP_ANALYTICAL_METHOD:
+    st.info("**BP Analytical is an ideal material-balance estimate.** Oil Supported shown in charts is "
+            "model-equivalent oil = injected water × calculated analytical VoW. "
+            "It is not measured incremental production. Review fluid FVFs, pressure balance and allocations before decisions.")
 
 # -----------------------------------------------------------------------------
 # Plot construction and tabs.
 # -----------------------------------------------------------------------------
-tabs = st.tabs(["Overview", "VoW Cross-plot", "Pattern Ranking", "CPS Ranking", "Manifold Ranking", "Surveillance", "Data & Guideline"])
+tabs = st.tabs(["Overview", "VoW Cross-plot", "Pattern Ranking", "CPS Ranking", "Manifold Ranking", "Surveillance", "Data & Guideline", "BP Analytical"])
 
 with tabs[0]:
     st.subheader("CPS production & injection overview")
@@ -822,7 +928,32 @@ with tabs[1]:
     with c:
         bubble_mode = st.selectbox("Marker sizing", ["Fixed", "Injected Water", "Oil Supported"], key="cross_bubble")
     with d:
-        point_labels = st.selectbox("Point labels", ["Off", "Top 10", "All"], key="cross_labels")
+        show_dot_labels = st.checkbox(
+            "Show labels on scatter dots", value=False, key="cross_show_dot_labels",
+            help="Switch the Point / CPS / Manifold names on or off directly on the chart. Hover labels always remain available.",
+        )
+
+    # The selected aggregation determines the useful default: all CPS and
+    # Manifold labels, but only the highest 10 Pattern points to avoid overlap.
+    if show_dot_labels:
+        label_col1, label_col2, label_col3 = st.columns([1.5, 1.2, 1.0])
+        with label_col1:
+            label_scope = st.selectbox(
+                "Which points to label", ["All dots", "Top 10 by Oil Supported"],
+                index=1 if plot_level == "Pattern" else 0,
+                key=f"cross_label_scope_{plot_level}",
+            )
+        with label_col2:
+            label_position = st.selectbox(
+                "Label position", ["Top center", "Middle right", "Bottom center", "Middle left"],
+                key="cross_label_position",
+            )
+        with label_col3:
+            label_font_size = st.slider("Dot label font size", 8, 22, 11, key="cross_label_size")
+    else:
+        label_scope = "All dots"
+        label_position = "Top center"
+        label_font_size = 11
 
     opts_a, opts_b, opts_c = st.columns([1, 1, 1])
     with opts_a:
@@ -919,6 +1050,24 @@ with tabs[1]:
         scatter_df["Oil Supported (mbd)"] = scatter_df["Supported mbd"]
         scatter_df["Raw VoW (stb/stb)"] = scatter_df["VoW Technical"]
         scatter_df["Normalised VoW (0–1)"] = scatter_df["VoW Normalized"]
+        # Labels are derived from the points displayed, not unrelated rows.
+        # Keep shorter Manifold names on the chart; the full group identifier
+        # remains visible in the hover tooltips.
+        if "Pattern" in scatter_df.columns:
+            dot_names = scatter_df["Pattern"].astype(str)
+        elif "Manifold" in scatter_df.columns:
+            dot_names = scatter_df["Manifold"].astype(str)
+            if "Reservoir" in scatter_df.columns and display_level == "Manifold × Reservoir":
+                dot_names = dot_names + " · " + scatter_df["Reservoir"].astype(str)
+        else:
+            dot_names = scatter_df["Point"].astype(str)
+        scatter_df["Dot label"] = ""
+        if show_dot_labels:
+            if label_scope == "All dots":
+                label_idx = scatter_df.index
+            else:
+                label_idx = scatter_df.nlargest(min(10, len(scatter_df)), "y").index
+            scatter_df.loc[label_idx, "Dot label"] = dot_names.loc[label_idx]
         if scatter_df.empty:
             st.info("No valid numerical points after filtering.")
         else:
@@ -949,10 +1098,18 @@ with tabs[1]:
 
             fig_sc = px.scatter(
                 scatter_df, x="x", y="y", color=color_by, size="Bubble", size_max=cfg.marker_size,
+                text="Dot label" if show_dot_labels else None,
                 hover_name="Point", color_discrete_map=color_map, hover_data=hover,
                 category_orders={"CPS": sorted(df["CPS"].unique(), key=cps_sort)},
             )
             fig_sc.update_traces(marker=dict(opacity=cfg.opacity, line=dict(width=max(0.5, cfg.line_width / 2), color=cfg.paper)))
+            if show_dot_labels:
+                fig_sc.update_traces(
+                    mode="markers+text",
+                    textposition=label_position.lower(),
+                    textfont=dict(family=cfg.font, size=label_font_size, color=cfg.text),
+                    cliponaxis=False,
+                )
             if use_quadrants and len(scatter_df) > 1:
                 mid_x, mid_y = float(scatter_df["x"].median()), float(scatter_df["y"].median())
                 fig_sc.add_vline(x=mid_x, line_dash="dash", line_color="#8793A4", line_width=cfg.line_width)
@@ -963,11 +1120,6 @@ with tabs[1]:
                 xs = np.linspace(scatter_df["x"].min(), scatter_df["x"].max(), 100)
                 fig_sc.add_trace(go.Scatter(x=xs, y=slope * xs + offset, mode="lines", name="OLS trend",
                                              line=dict(color="#D64E60", width=cfg.line_width + 1, dash="dot"), hoverinfo="skip"))
-            if point_labels != "Off":
-                to_label = scatter_df if point_labels == "All" else scatter_df.nlargest(min(10, len(scatter_df)), "y")
-                fig_sc.add_trace(go.Scatter(x=to_label["x"], y=to_label["y"], mode="text", text=to_label["Point"],
-                                             textposition="top center", textfont=dict(size=max(9, cfg.tick_size - 1), color=cfg.text),
-                                             showlegend=False, hoverinfo="skip", cliponaxis=False))
             apply_style(fig_sc, cfg, f"{custom_title} — {display_level}", x_caption, y_caption, show_legend=show_category_legend)
             manual_scatter_axes = st.checkbox("Set manual X/Y axis ranges", False, key="manual_scatter_axes")
             if manual_scatter_axes:
@@ -1176,12 +1328,44 @@ with tabs[6]:
     with st.expander("Source plus calculated columns", expanded=False):
         st.dataframe(work, use_container_width=True, hide_index=True, height=340)
     st.markdown("### Guideline — Value of Water")
+    st.markdown("#### BP Analytical Approach (source: supplied BP definition slides, Eqs. 10 and 11)")
+    st.markdown("Under the slides' **ideal displacement** and **constant reservoir pressure** "
+                "assumptions, the water-injection contribution is represented in reservoir-volume balance. "
+                "The equation below estimates the oil/water ratio from produced fluid and FVFs, "
+                "without claiming to measure field-scale incremental oil response.")
+    st.latex(r"\mathrm{VoW}_{BP}=\frac{B_{wi} Q_o}{Q_o B_o + Q_w B_{wp}+Q_g B_g}")
+    st.latex(r"\mathrm{VoW}_{BP}=\frac{B_{wi}}{B_o + \frac{WC}{1-WC}B_{wp} + (R_p-R_s)B_g}")
+    st.markdown("Here `Qo`, `Qw` are total **stock-tank** produced oil and water; "
+                "`WC = Qw/(Qo+Qw)`; `Bo` is oil FVF (rb/stb); `Bwi` and `Bwp` are "
+                "injected- and produced-water FVFs (rb/stb); `Qg` is gas production (scf); "
+                "`Bg` is gas FVF (rb/scf); `(Rp−Rs)` is produced-gas minus solution-gas ratio (scf/stb). "
+                "Gas is omitted by default rather than assuming a nonzero GOR.")
+    st.latex(r"Q_{o,\mathrm{supported,BP}}^{\mathrm{equiv}}=Q_{wi,\mathrm{actual}}\times\mathrm{VoW}_{BP}")
+    st.markdown("The analytical calculation is made separately for every Pattern using its Reservoir-specific `Bo`. "
+                "At CPS or Manifold level we **sum the BP-equivalent supported-oil volumes** and divide by "
+                "summed injected water; we do not average FVFs, pattern VoW scores or normalized scores.")
+    st.dataframe(pd.DataFrame([{"Reservoir": k, "Bo (rb/stb)": v} for k,v in bo_by_reservoir.items()]),
+                 use_container_width=True, hide_index=True)
+    st.caption(f"Bwi = {bp_bwi:.3f} rb/stb; Bwp = {bp_bwp:.3f} rb/stb; "
+               f"Rp−Rs = {bp_delta_gor:.2f} scf/stb; Bg = {bp_bg:.5f} rb/scf; "
+               f"gas contribution {'ON' if include_gas else 'OFF'}. "
+               "These are user-adjustable assumptions, not pressure-calibrated measurements.")
+    st.markdown("**Important:** BP slides use a closed-system / ideal-displacement simplification to derive the relation. "
+                "Their general material-balance form includes gas injection, aquifer influx and expansion; "
+                "those additional support mechanisms are not estimated by the simplified equation here. "
+                "The calculated Oil Supported may exceed recorded oil production under inconsistent field conditions: "
+                "those cases are flagged in QC instead of being silently clipped.")
+    st.divider()
+    st.markdown("#### Existing production / injection ratio approach")
     st.markdown("**1. Identify Oil Supported.** When an actual injection-attributable oil estimate is available, it should be used. The October Excel contains Produced Oil, but no direct Oil Supported / incremental oil column.")
     st.latex(r"Q_{o,\mathrm{supported}}=Q_{o,\mathrm{produced}}\times f_{\mathrm{support}}")
-    st.markdown(f"Current method: **{method}**. Current oil-support percentage (when relevant): **{share:g}%**. Exclude zero-injection Pattern oil from produced-oil proxy: **{exclude_zero_supported}** (only applies to Produced Oil methods).")
+    st.markdown(f"Selected VoW method: **{method}**. The existing support definition is applied only when that method is selected; "
+                f"the BP method instead uses analytical FVFs and water cut. Manual support percentage, where used: **{share:g}%**.")
     st.markdown("**2. Calculate original Value of Water (VoW).**")
     st.latex(r"\mathrm{VoW}_{\mathrm{technical}}=\frac{\sum Q_{o,\mathrm{supported}}\ [\mathrm{stb}]}{\sum W_{\mathrm{inj}}\ [\mathrm{stb}]}\ \ [\mathrm{stb\ oil/stb\ injected\ water}]")
-    st.markdown("This is the original volume ratio (stb/stb). It can exceed 1 and is undefined for zero injection. It is not proof of incremental recovery.")
+    st.markdown("For the existing method this is the production/injection ratio. With BP Analytical selected, "
+                "the numerator is the predicted BP-equivalent supported-oil volume. Both remain raw stb/stb ratios, "
+                "and normalisation is a separate relative chart score; neither proves incremental oil recovery.")
     st.markdown("**Display normalisation (0–1)** — separate max for each aggregation level:")
     st.latex(r"\mathrm{VoW}_{\mathrm{norm},L}=\frac{\mathrm{VoW}_{\mathrm{raw},L}}{\max_{g\in L}(\mathrm{VoW}_{\mathrm{raw},g})},\quad L\in\{\mathrm{Pattern,\ CPS,\ Manifold}\}")
     st.markdown(
@@ -1231,6 +1415,37 @@ with tabs[6]:
     st.markdown("**Limitations:** contemporaneous production/injection correlation cannot establish causation; lagged response, injector-producer allocation factors, underlying decline, pressure support, reservoir connectivity, and water cycling must be evaluated before making injection-rate decisions.")
     st.markdown("Useful technical background: [SPE — Mature Flood Surveillance Using Streamlines](https://jpt.spe.org/mature-flood-surveillance-using-streamlines) and [SPE — Role of Surveillance Plots in Diagnosing Waterfloods](https://jpt.spe.org/twa/role-surveillance-plots-diagnosing-waterfloods).")
 
+with tabs[7]:
+    st.subheader("BP Analytical — Value of Water comparison")
+    st.caption("BP slides' ideal-displacement equation (Eq. 10/11). "
+               "Shows analytical results even when the original method is selected elsewhere.")
+    st.latex(r"\mathrm{VoW}_{BP}=\frac{B_{wi}\,Q_o}{B_o Q_o+B_{wp}Q_w+B_g Q_g}")
+    compare = cps[["CPS", "Patterns", "Injection", "BP VoW (raw)", "Existing VoW (raw)"]].copy()
+    long_compare = compare.melt(id_vars="CPS", value_vars=["BP VoW (raw)", "Existing VoW (raw)"],
+                                var_name="Method", value_name="Raw VoW (stb/stb)")
+    fig_bp = px.bar(long_compare, x="CPS", y="Raw VoW (stb/stb)", color="Method", barmode="group",
+                    color_discrete_map={"BP VoW (raw)": "#12A6A4", "Existing VoW (raw)": "#8D62A6"})
+    apply_style(fig_bp, cfg, "CPS VoW | BP analytical vs existing definition", "CPS", "Raw VoW (stb/stb)")
+    plot(fig_bp, "bp_comparison_cps")
+    b1, b2 = st.columns(2)
+    with b1:
+        st.markdown("**Reservoir input Bo (rb/stb)**")
+        st.dataframe(pd.DataFrame([{"Reservoir": k, "Bo (rb/stb)": v} for k, v in bo_by_reservoir.items()]),
+                     hide_index=True, use_container_width=True)
+        st.caption("Edit values in the sidebar: BP Analytical VoW — reservoir FVF inputs.")
+    with b2:
+        st.markdown("**CPS analytical calculations**")
+        st.dataframe(compare.drop(columns="Injection"), hide_index=True, use_container_width=True)
+    st.markdown("**Pattern-level analytical calculations**")
+    analytical_cols = ["Pattern", "Reservoir", "CPS", "Manifold", "Bo", "Oil", "Water", "Injection",
+                       "BP Offtake (rb)", "BP VoW (raw)", "BP Oil Supported (stb)", "Existing Supported"]
+    st.dataframe(work[analytical_cols].sort_values("BP VoW (raw)", ascending=False),
+                 use_container_width=True, hide_index=True, height=420)
+    st.info("The BP result is a fluid-balance estimate under ideal displacement and constant-pressure "
+            "assumptions. Mixed-reservoir CPS/Manifold scores are aggregated from the Pattern-level "
+            "water-injection-weighted equivalent volumes, not averaged Bo values.")
+
+
 # -----------------------------------------------------------------------------
 # Export all selected rows and rollups with calculation assumptions / QC.
 # -----------------------------------------------------------------------------
@@ -1252,7 +1467,7 @@ with ex2:
                        file_name="CPS_VoW_Ranking.csv", mime="text/csv", use_container_width=True)
 with ex3:
     try:
-        xlsx_bytes = file_download_excel(pattern_export, cps_export, manifold_export, work, qc_table, method, n_months, n_days, share, exclude_zero_supported, norm_references)
+        xlsx_bytes = file_download_excel(pattern_export, cps_export, manifold_export, work, qc_table, method, n_months, n_days, share, exclude_zero_supported, norm_references, bo_by_reservoir, bp_bwi, bp_bwp, bp_delta_gor, bp_bg)
         st.download_button("Download Full Excel + QC + Guideline", xlsx_bytes,
                            file_name="Pattern_Waterflood_VoW_Analysis.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
@@ -1262,3 +1477,4 @@ if not manifold_export.empty:
     st.download_button("Download Manifold Ranking CSV", manifold_export.to_csv(index=False).encode("utf-8-sig"),
                        file_name="Manifold_VoW_Ranking.csv", mime="text/csv", use_container_width=True)
 st.caption("Source workbook and optional Manifold mapping are read in memory for the current Streamlit session. Do not commit confidential field datasets to a public GitHub repository.")
+
