@@ -26,6 +26,7 @@ st.set_page_config(page_title="Pattern Waterflood | Rumaila", page_icon="💧", 
 FIELDS = {
     "Pattern": ["Pattern Name", "Pattern", "Pattern ID"],
     "Reservoir": ["Reservoir", "Reservoir Name", "Resevoir", "Resevoir Name", "Reservior", "Reservior Name", "Reservoir Type"],
+    "Manifold": ["Manifold", "Manifold Name", "Injection Manifold", "Production Manifold", "Manifold ID", "Manifold Code"],
     "Oil": ["Produced Oil (stb)", "Produced Oil", "Oil Production (stb)", "Oil Volume"],
     "Water": ["Produced Water (stb)", "Produced Water", "Water Production (stb)"],
     "Injection": ["Injected Water (stb)", "Injected Water", "Water Injection (stb)", "Water Injected"],
@@ -41,7 +42,7 @@ FIELDS = {
     "Support Fraction": ["Oil Support Fraction", "Supported Fraction", "Support Factor", "Support Fraction"],
 }
 REQUIRED = ["Pattern", "Oil", "Water", "Injection"]
-NUMERIC_FIELDS = [k for k in FIELDS if k not in ("Pattern", "Reservoir")]
+NUMERIC_FIELDS = [k for k in FIELDS if k not in ("Pattern", "Reservoir", "Manifold")]
 VOL_STB_TO_M3 = 0.158987294928
 UNIT_OPTIONS = {
     "stb": (1.0, "stb"),
@@ -173,6 +174,78 @@ def read_sheet(file_bytes: bytes, extension: str, name: str) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(file_bytes), sheet_name=name)
 
 
+def clean_manifold(value: object) -> str:
+    if pd.isna(value) or str(value).strip().lower() in ("", "nan", "none", "unmapped", "unknown", "n/a", "-"):
+        return "Unmapped"
+    return str(value).strip()
+
+
+def map_manifolds(frame: pd.DataFrame, mapping: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Safely apply one Manifold per Pattern+Reservoir; never guess from a name.
+
+    Supports a Pattern-only map only when that Pattern is unambiguous across
+    reservoirs. Conflicting assignments stay unmapped with a QC warning.
+    """
+    df = frame.copy()
+    notes: list[str] = []
+    pc = col_lookup(mapping, ["Pattern", "Pattern Name", "Pattern ID"])
+    mc = col_lookup(mapping, FIELDS["Manifold"])
+    rc = col_lookup(mapping, FIELDS["Reservoir"])
+    if not pc or not mc:
+        return df, ["Mapping requires Pattern (or Pattern Name) and Manifold columns."]
+    cols = [pc, mc] + ([rc] if rc else [])
+    ref = mapping[cols].copy()
+    ref.columns = ["Pattern", "Manifold"] + (["Reservoir"] if rc else [])
+    ref["Pattern"] = ref["Pattern"].fillna("").astype(str).str.strip()
+    ref["Manifold"] = ref["Manifold"].map(clean_manifold)
+    ref = ref.loc[ref["Pattern"].ne("") & ref["Manifold"].ne("Unmapped")].copy()
+    if ref.empty:
+        return df, ["No assigned Manifold entries found in mapping; cross-plot requires a mapping."]
+    df["_map_key"] = df["Pattern"].str.casefold()
+    ref["_map_key"] = ref["Pattern"].str.casefold()
+    join = ["_map_key"]
+    if rc:
+        df["_res_key"] = df["Reservoir"].str.casefold()
+        ref["_res_key"] = ref["Reservoir"].fillna("").astype(str).str.strip().map(canonical_reservoir).str.casefold()
+        join.append("_res_key")
+    else:
+        amb = df.groupby("_map_key")["Reservoir"].nunique()
+        ambiguous = set(amb.loc[amb.gt(1)].index)
+        if ambiguous:
+            ref = ref.loc[~ref["_map_key"].isin(ambiguous)].copy()
+            notes.append(f"{len(ambiguous)} Pattern names span multiple reservoirs; include a Reservoir column in the mapping to disambiguate them.")
+    conflicts = ref.groupby(join, dropna=False)["Manifold"].nunique()
+    conflict_keys = conflicts.loc[conflicts.gt(1)]
+    if len(conflict_keys):
+        notes.append(f"{len(conflict_keys)} conflicting Pattern→Manifold assignments ignored. Each Pattern needs one assignment; split multi-Manifold allocation upstream.")
+        bad = ref.set_index(join).index.isin(conflict_keys.index)
+        ref = ref.loc[~bad]
+    ref = ref.drop_duplicates(join, keep="first")
+    if ref.empty:
+        return frame.copy(), notes
+    assigned = df.merge(ref[join + ["Manifold"]].rename(columns={"Manifold": "_assigned"}), on=join, how="left", sort=False)
+    changed = assigned["_assigned"].notna()
+    assigned.loc[changed, "Manifold"] = assigned.loc[changed, "_assigned"]
+    assigned = assigned.drop(columns=["_map_key", "_res_key", "_assigned"], errors="ignore")
+    notes.append(f"{int(changed.sum())} source rows matched to a Manifold.")
+    return assigned, notes
+
+
+def display_volume(values: pd.Series, factor: float, months: float, mode: str, days: int) -> pd.Series:
+    divisor = days if mode == "Average per day" else (months if mode == "Average per month" else 1)
+    return values * factor / divisor
+
+
+def attach_display(frame: pd.DataFrame, factor: float, months: float, mode: str, days: int) -> pd.DataFrame:
+    frame = frame.copy()
+    for original, name in (("Oil", "Oil Display"), ("Water", "Water Display"),
+                           ("Injection", "Injection Display"), ("Supported", "Supported Display")):
+        frame[name] = display_volume(frame[original], factor, months, mode, days)
+    frame["Supported mbd"] = frame["Supported"] / (days * 1000.0)
+    frame["Injection mbd"] = frame["Injection"] / (days * 1000.0)
+    return frame
+
+
 def standardise(raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str], dict[str, str]]:
     # Detect before discarding unnamed columns: the reservoir header is
     # sometimes overwritten (e.g., B1='Mishrif') or left blank in Excel.
@@ -188,10 +261,11 @@ def standardise(raw: pd.DataFrame) -> tuple[pd.DataFrame, list[str], dict[str, s
             df[key] = raw[matched[key]]
         else:
             # Missing Reservoir must never silently become Mishrif.
-            df[key] = "Unspecified" if key == "Reservoir" else np.nan
+            df[key] = "Unspecified" if key == "Reservoir" else ("Unmapped" if key == "Manifold" else np.nan)
     df["Pattern"] = df["Pattern"].astype("string").str.strip()
     df = df[df["Pattern"].notna() & df["Pattern"].ne("")].copy()
     df["Reservoir"] = df["Reservoir"].map(canonical_reservoir)
+    df["Manifold"] = df["Manifold"].map(clean_manifold)
     for key in NUMERIC_FIELDS:
         df[key] = to_numeric(df[key])
     # User files may store fractions [0,1] or percentage points [0,100].
@@ -312,7 +386,7 @@ def scale_volume(x: pd.Series, factor: float, months: float, monthly: bool) -> p
     return x * factor / (months if monthly else 1)
 
 
-def file_download_excel(patterns: pd.DataFrame, cps: pd.DataFrame, detailed: pd.DataFrame, qc: pd.DataFrame, method: str, months: int, share: float, exclude_zero: bool) -> bytes:
+def file_download_excel(patterns: pd.DataFrame, cps: pd.DataFrame, manifold: pd.DataFrame, detailed: pd.DataFrame, qc: pd.DataFrame, method: str, months: int, days: int, share: float, exclude_zero: bool) -> bytes:
     how = "Excel supported oil" if method == "Excel: Oil Supported" else ("Excel support fraction × produced oil" if method == "Excel: Support Fraction" else f"Produced oil × {share:g}%")
     guide = pd.DataFrame([
         ("Scope", f"Uploaded period: {months} months. Raw data are total volumes in stb."),
@@ -324,12 +398,16 @@ def file_download_excel(patterns: pd.DataFrame, cps: pd.DataFrame, detailed: pd.
         ("Interpretation", "Produced oil proxy is NOT demonstrated incremental oil caused by water injection."),
         ("CPS", "CPS number extracted from Pattern name, e.g. A-CPS2..., CPS-2-N."),
         ("CPS typo", "CSP4 variant mapped to CPS4; check original record."),
+        ("Manifold data", "Only explicit source column or Pattern-to-Manifold mapping. Unmapped excluded from Manifold rollup."),
+        ("Daily rate (mbd)", f"Full-period stb / {days} days / 1000; mbd means thousand stb/day."),
+        ("VoW > 2", "Possible when numerator exceeds twice denominator; not a recovery factor. Confirm volumes, allocations and reporting periods."),
         ("VRR", "Reported source VRR is informational. Group averages are not field-corrected VRR."),
     ], columns=["Topic", "Rule / assumption"])
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         patterns.to_excel(writer, sheet_name="Pattern_Ranking", index=False)
         cps.to_excel(writer, sheet_name="CPS_Ranking", index=False)
+        manifold.to_excel(writer, sheet_name="Manifold_Ranking", index=False)
         detailed.to_excel(writer, sheet_name="Calculated_Data", index=False)
         qc.to_excel(writer, sheet_name="QC", index=False)
         guide.to_excel(writer, sheet_name="Guideline", index=False)
@@ -371,7 +449,8 @@ file = st.file_uploader("Browse your Pattern Excel or CSV file", type=["xlsx", "
 if file is None:
     st.info("Upload the October Pattern workbook to activate the dashboard. No source field data is stored in the app or uploaded to GitHub.")
     with st.expander("Required Excel structure", expanded=True):
-        st.write("Required: **Pattern Name, Produced Oil (stb), Produced Water (stb), Injected Water (stb)**. Optional: Reservoir, VRR, pressure, watercut, targets, and *Oil Supported (stb)*.")
+        st.write("Required: **Pattern Name, Produced Oil (stb), Produced Water (stb), Injected Water (stb)**. Optional: Reservoir, Manifold, VRR, pressure, watercut, targets, and Oil Supported (stb).")
+        st.write("For Manifold analysis, add a Manifold column or upload a Pattern → Manifold mapping inside the app; Pattern names alone cannot reliably identify Manifold.")
         st.write("Automatic CPS parsing handles `A-CPS2-i9-R387`, `CPS-1-N` and flags the `CSP4` spelling variant.")
     st.stop()
 
@@ -405,19 +484,65 @@ res_counts = df["Reservoir"].value_counts(dropna=False)
 st.caption("Imported reservoir coverage: " + "  |  ".join(f"{name}: {count:,}" for name, count in res_counts.items()))
 
 # -----------------------------------------------------------------------------
+# Optional Manifold mapping: the current October source has NO Manifold field.
+# -----------------------------------------------------------------------------
+with st.expander("Manifold mapping — optional (needed for Manifold cross-plots)", expanded=False):
+    st.caption("This October workbook has no Manifold column. Use the mapping below; no CPS/Pattern-name-based guess is made. All Manifold comparisons exclude unmapped rows, with coverage explicitly displayed.")
+    mapping_template = (df[["Pattern", "CPS", "Reservoir", "Manifold"]]
+                        .drop_duplicates(subset=["Pattern", "Reservoir"])
+                        .sort_values(["CPS", "Reservoir", "Pattern"]).reset_index(drop=True))
+    st.download_button("Download Pattern → Manifold mapping template (CSV)",
+                       mapping_template.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="Pattern_Manifold_Mapping_Template.csv", mime="text/csv")
+    mapping_file = st.file_uploader("Upload completed mapping CSV / Excel", type=["csv", "xlsx", "xls"],
+                                    key="manifold_mapping_upload")
+    if mapping_file is not None:
+        try:
+            mapping_bytes = mapping_file.getvalue()
+            ext_mapping = mapping_file.name.rsplit(".", 1)[-1].lower()
+            map_df = read_sheet(mapping_bytes, ext_mapping, sheet_names(mapping_bytes, ext_mapping)[0])
+            df, mapping_notes = map_manifolds(df, map_df)
+            for note in mapping_notes:
+                st.caption(note)
+            if any(x.startswith("Mapping requires") for x in mapping_notes):
+                st.error("Mapping not applied. Please correct its headers.")
+        except Exception as exc:
+            st.error(f"Cannot read Manifold mapping: {exc}")
+    manual_map = st.checkbox("Edit Manifold assignments directly in the app", False,
+                             key="manifold_manual_toggle")
+    if manual_map:
+        st.caption("Fill Manifold values for the desired Patterns. Existing values are kept. For multiple Manifolds per Pattern, first supply a reliable allocated data table; do not assign volumes twice.")
+        edit_df = (df[["Pattern", "CPS", "Reservoir", "Manifold"]]
+                   .drop_duplicates(subset=["Pattern", "Reservoir"]).reset_index(drop=True))
+        edited = st.data_editor(edit_df, hide_index=True, use_container_width=True, height=360,
+                                disabled=["Pattern", "CPS", "Reservoir"], num_rows="fixed",
+                                key="manifold_editor")
+        df, mapping_notes = map_manifolds(df, edited)
+        for note in mapping_notes:
+            st.caption(note)
+    assigned_count = int(df["Manifold"].ne("Unmapped").sum())
+    st.caption(f"Mapped source rows: **{assigned_count:,} / {len(df):,}**. A valid manifold cross-plot needs mapped records with nonzero injection.")
+
+# -----------------------------------------------------------------------------
 # Sidebar controls: global charts / period / support definition.
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Data & calculation")
     n_months = st.number_input("Months represented by workbook", 1, 36, 3, 1)
-    period = st.radio("Display volume as", [f"{n_months}-month total", "Average per month"], index=0,
-                      help="'3-month total' means total over uploaded period (normally 3 months). Monthly average divides every volume by the number of months.")
+    n_days = st.number_input("Days represented by workbook", min_value=1, max_value=3660,
+                             value=int(n_months)*30, step=1,
+                             help="Used to calculate daily rates: period total stb / actual number of days. Default is months × 30; set actual calendar days (e.g. 92) where known.")
+    period = st.radio("Display volume as", [f"{n_months}-month total", "Average per month", "Average per day"], index=0,
+                      help="Monthly = total volume / months; daily = total volume / selected days. VoW remains the ratio of unscaled volumes.")
     monthly = period == "Average per month"
     if n_months != 3:
         st.caption(f"Workbook is treated as a {n_months}-month period; this does not change the underlying totals.")
     unit = st.selectbox("Volume unit", list(UNIT_OPTIONS), index=1)
     factor, unit_label = UNIT_OPTIONS[unit]
-    period_label = f"{unit_label}/month" if monthly else f"{unit_label} / period"
+    period_label = f"{unit_label}/day" if period == "Average per day" else (f"{unit_label}/month" if monthly else f"{unit_label} / period")
+    if unit == "Mstb" and period == "Average per day":
+        period_label = "mbd (thousand stb/day)"
+    st.caption("**mbd** = thousand stock-tank barrels per day (Mstb/d). Enter exact period days for accurate daily rates.")
     support_methods = ["Produced Oil (screening proxy)", "Produced Oil × manual support %"]
     if df["Actual Supported Oil"].notna().any():
         support_methods.insert(0, "Excel: Oil Supported")
@@ -498,18 +623,14 @@ if filtered.empty:
 work = support_scenario(filtered, method, share)
 if exclude_zero_supported and method.startswith("Produced Oil"):
     work.loc[work["Injection"].isna() | work["Injection"].le(0), "Supported"] = 0.0
-pat = rollup(work, ["Pattern", "CPS", "Reservoir"])
-cps = rollup(work, ["CPS"])
+pat = attach_display(rollup(work, ["Pattern", "CPS", "Reservoir", "Manifold"]), factor, n_months, period, n_days)
+cps = attach_display(rollup(work, ["CPS"]), factor, n_months, period, n_days)
 cps = cps.sort_values("CPS", key=lambda x: x.map(cps_sort)).reset_index(drop=True)
-pat["Oil Display"] = scale_volume(pat["Oil"], factor, n_months, monthly)
-pat["Water Display"] = scale_volume(pat["Water"], factor, n_months, monthly)
-pat["Injection Display"] = scale_volume(pat["Injection"], factor, n_months, monthly)
-pat["Supported Display"] = scale_volume(pat["Supported"], factor, n_months, monthly)
-cps["Oil Display"] = scale_volume(cps["Oil"], factor, n_months, monthly)
-cps["Water Display"] = scale_volume(cps["Water"], factor, n_months, monthly)
-cps["Injection Display"] = scale_volume(cps["Injection"], factor, n_months, monthly)
-cps["Supported Display"] = scale_volume(cps["Supported"], factor, n_months, monthly)
-
+mapped_work = work.loc[work["Manifold"].ne("Unmapped")].copy()
+# CPS + Manifold is the grouping key so a reused FM name in different CPS areas
+# is NOT merged into one misleading point.
+manifold = attach_display(rollup(mapped_work, ["CPS", "Manifold"]), factor, n_months, period, n_days) if not mapped_work.empty else pd.DataFrame()
+valid_manifold = manifold.loc[manifold["VoW Valid"] & manifold["VoW Technical"].notna()].copy() if not manifold.empty else pd.DataFrame()
 valid_pat = pat[pat["VoW Valid"] & pat["VoW Technical"].notna()].copy()
 valid_cps = cps[cps["VoW Valid"] & cps["VoW Technical"].notna()].copy()
 total_oil = float(work["Oil"].sum())
@@ -522,6 +643,8 @@ weighted_vow = total_supported / total_inj if total_inj > 0 else np.nan
 qc_frames = []
 for condition, text_label in [
     (filtered["Injection"].eq(0), "Zero water injection — VoW undefined"),
+    (filtered["Manifold"].eq("Unmapped"), "Manifold assignment missing — excluded from Manifold aggregation"),
+    (work["Injection"].gt(0) & work["Supported"].gt(2 * work["Injection"]), "VoW > 2 — review context; mathematically possible"),
     (filtered["Injection"].isna(), "Missing injected volume"),
     (filtered["Oil"].isna(), "Missing produced oil volume"),
     (filtered["Water"].isna(), "Missing produced water volume"),
@@ -530,18 +653,18 @@ for condition, text_label in [
     (filtered["Injection"].lt(0) | filtered["Oil"].lt(0) | filtered["Water"].lt(0), "Negative source volume"),
 ]:
     if condition.any():
-        a = filtered.loc[condition, ["Source Row", "Pattern", "CPS", "Reservoir", "Oil", "Water", "Injection", "VRR", "CPS QC"]].copy()
+        a = filtered.loc[condition, ["Source Row", "Pattern", "CPS", "Reservoir", "Manifold", "Oil", "Water", "Injection", "VRR", "CPS QC"]].copy()
         a["QC Reason"] = text_label
         qc_frames.append(a)
-qc_table = pd.concat(qc_frames, ignore_index=True) if qc_frames else pd.DataFrame(columns=["Source Row", "Pattern", "CPS", "Reservoir", "QC Reason"])
+qc_table = pd.concat(qc_frames, ignore_index=True) if qc_frames else pd.DataFrame(columns=["Source Row", "Pattern", "CPS", "Reservoir", "Manifold", "QC Reason"])
 
 # Top summary, intentionally independent of tab selection to avoid empty overview after navigation.
-st.caption(f"{len(filtered):,} source rows · {len(pat):,} Patterns · {len(cps):,} CPS groups · {n_months}-month source period")
+st.caption(f"{len(filtered):,} source rows · {len(pat):,} Patterns · {len(cps):,} CPS groups · {len(valid_manifold):,} valid Manifold groups · {n_days} period days")
 met1, met2, met3, met4, met5 = st.columns(5)
-met1.metric(f"Produced Oil ({period_label})", pretty(total_oil * factor / (n_months if monthly else 1), 1))
-met2.metric(f"Produced Water ({period_label})", pretty(total_water * factor / (n_months if monthly else 1), 1))
-met3.metric(f"Injected Water ({period_label})", pretty(total_inj * factor / (n_months if monthly else 1), 1))
-met4.metric(f"Oil Supported ({period_label})", pretty(total_supported * factor / (n_months if monthly else 1), 1))
+met1.metric(f"Produced Oil ({period_label})", pretty(float(display_volume(pd.Series([total_oil]), factor, n_months, period, n_days).iloc[0]), 1))
+met2.metric(f"Produced Water ({period_label})", pretty(float(display_volume(pd.Series([total_water]), factor, n_months, period, n_days).iloc[0]), 1))
+met3.metric(f"Injected Water ({period_label})", pretty(float(display_volume(pd.Series([total_inj]), factor, n_months, period, n_days).iloc[0]), 1))
+met4.metric(f"Oil Supported ({period_label})", pretty(float(display_volume(pd.Series([total_supported]), factor, n_months, period, n_days).iloc[0]), 1))
 met5.metric("Weighted VoW (stb/stb)", pretty(weighted_vow, 3))
 if method.startswith("Produced Oil"):
     st.warning("**Interpretation:** Oil Supported is an assumption based on Produced Oil, not measured incremental oil attributable to injection. Use an actual supported-oil column for defensible causal Value of Water.", icon="⚠️")
@@ -549,7 +672,7 @@ if method.startswith("Produced Oil"):
 # -----------------------------------------------------------------------------
 # Plot construction and tabs.
 # -----------------------------------------------------------------------------
-tabs = st.tabs(["Overview", "VoW Cross-plot", "Pattern Ranking", "CPS Ranking", "Surveillance", "Data & Guideline"])
+tabs = st.tabs(["Overview", "VoW Cross-plot", "Pattern Ranking", "CPS Ranking", "Manifold Ranking", "Surveillance", "Data & Guideline"])
 
 with tabs[0]:
     st.subheader("CPS production & injection overview")
@@ -585,9 +708,9 @@ with tabs[1]:
     st.subheader("Value of Water vs Oil Supported")
     a, b, c, d = st.columns(4)
     with a:
-        plot_level = st.radio("Aggregation", ["Pattern", "CPS"], horizontal=True, key="cross_level")
+        plot_level = st.radio("Aggregation", ["Pattern", "CPS", "Manifold"], horizontal=True, key="cross_level")
     with b:
-        color_by = st.selectbox("Color by", ["CPS", "Reservoir", "Pattern"], key="cross_color_by")
+        color_by = st.selectbox("Color by", ["CPS", "Reservoir", "Pattern", "Manifold"], key="cross_color_by")
     with c:
         bubble_mode = st.selectbox("Marker sizing", ["Fixed", "Injected Water", "Oil Supported"], key="cross_bubble")
     with d:
@@ -601,6 +724,10 @@ with tabs[1]:
     with opts_c:
         show_category_legend = st.checkbox("Show category legend", value=color_by != "Pattern", key=f"cross_show_legend_{color_by}")
 
+    oil_axis = st.radio("Cross-plot Oil Supported Y-axis", ["Average per day (mbd)", "Follow global volume setting"],
+                        index=0, horizontal=True, key="cross_y_unit",
+                        help="Default: supported oil (stb) / days in uploaded period / 1000. The X-axis VoW is unchanged.")
+    y_caption = "Oil Supported (mbd)" if oil_axis.startswith("Average") else f"Oil Supported ({period_label})"
     # Stable colors independent of filtering. CPS retains the editable sidebar colors.
     palette_name = "Plotly"
     custom_color = {}
@@ -616,12 +743,30 @@ with tabs[1]:
     display_level = plot_level
     if plot_level == "Pattern":
         scatter_df = valid_pat.copy()
+    elif plot_level == "Manifold":
+        if mapped_work.empty:
+            scatter_df = pd.DataFrame()
+            st.info("No Manifold mapping has been provided. Open 'Manifold mapping' above, upload a Pattern → Manifold CSV or edit the table.")
+        elif color_by == "Pattern":
+            scatter_df = valid_pat.loc[valid_pat["Manifold"].ne("Unmapped")].copy()
+            display_level = "Pattern breakdown within mapped Manifolds"
+        elif color_by == "Reservoir":
+            scatter_df = attach_display(rollup(mapped_work, ["CPS", "Manifold", "Reservoir"]), factor, n_months, period, n_days)
+            scatter_df = scatter_df.loc[scatter_df["VoW Valid"]].copy()
+            display_level = "CPS × Manifold × Reservoir"
+        else:
+            scatter_df = valid_manifold.copy()
+            display_level = "CPS × Manifold"
+    elif color_by == "Manifold":
+        scatter_df = valid_manifold.copy()
+        display_level = "Manifold breakdown by CPS"
+        if scatter_df.empty:
+            st.info("Color by Manifold requires a Pattern → Manifold mapping.")
     elif color_by == "Reservoir":
         # One point per CPS / Reservoir, so no potentially mixed-reservoir CPS is
         # incorrectly painted as belonging to just one reservoir.
         scatter_df = rollup(work, ["CPS", "Reservoir"])
-        scatter_df["Injection Display"] = scale_volume(scatter_df["Injection"], factor, n_months, monthly)
-        scatter_df["Supported Display"] = scale_volume(scatter_df["Supported"], factor, n_months, monthly)
+        scatter_df = attach_display(scatter_df, factor, n_months, period, n_days)
         scatter_df = scatter_df.loc[scatter_df["VoW Valid"]].copy()
         display_level = "CPS × Reservoir"
         st.caption("Reservoir coloring at CPS level shows one aggregated point per CPS–Reservoir combination, rather than assigning an arbitrary reservoir to the entire CPS.")
@@ -638,10 +783,14 @@ with tabs[1]:
         st.info("No records with a positive injected-water volume and a defined Oil Supported value can be plotted. See QC.")
     else:
         scatter_df["x"] = scatter_df[x_field]
-        scatter_df["y"] = scatter_df["Supported Display"]
+        scatter_df["y"] = scatter_df["Supported mbd"] if oil_axis.startswith("Average") else scatter_df["Supported Display"]
         scatter_df = scatter_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["x", "y"])
         if "Pattern" in scatter_df.columns:
             scatter_df["Point"] = scatter_df["Pattern"]
+        elif "Manifold" in scatter_df.columns:
+            scatter_df["Point"] = scatter_df["CPS"] + " · " + scatter_df["Manifold"]
+            if "Reservoir" in scatter_df.columns:
+                scatter_df["Point"] += " · " + scatter_df["Reservoir"]
         elif "Reservoir" in scatter_df.columns:
             scatter_df["Point"] = scatter_df["CPS"] + " · " + scatter_df["Reservoir"]
         else:
@@ -652,7 +801,8 @@ with tabs[1]:
         scatter_df["Bubble"] = scatter_df["Bubble"].clip(lower=0).fillna(0)
         scatter_df["Water cut (%)"] = scatter_df["Watercut"] * 100
         scatter_df["Injected Water"] = scatter_df["Injection Display"]
-        scatter_df["Oil Supported"] = scatter_df["Supported Display"]
+        scatter_df["Oil Supported"] = scatter_df["y"]
+        scatter_df["Oil Supported (mbd)"] = scatter_df["Supported mbd"]
         scatter_df["Technical VoW"] = scatter_df["VoW Technical"]
         if scatter_df.empty:
             st.info("No valid numerical points after filtering.")
@@ -661,6 +811,9 @@ with tabs[1]:
                 color_map = cps_colors
             elif color_by == "Reservoir":
                 color_map = custom_color
+            elif color_by == "Manifold":
+                pal = getattr(px.colors.qualitative, palette_name)
+                color_map = {m: pal[i % len(pal)] for i, m in enumerate(sorted(df["Manifold"].unique().tolist()))}
             else:
                 palette = getattr(px.colors.qualitative, palette_name)
                 # Stable global ordering maintains the same color for a Pattern
@@ -669,10 +822,13 @@ with tabs[1]:
                 color_map = {name: palette[i % len(palette)] for i, name in enumerate(patterns_all)}
 
             hover = {"CPS": True, "Injected Water": ":,.2f", "Oil Supported": ":,.2f",
+                     "Oil Supported (mbd)": ":,.2f",
                      "Technical VoW": ":.4f", "Water cut (%)": ":.1f",
                      "x": False, "y": False, "Bubble": False}
             if "Reservoir" in scatter_df.columns:
                 hover["Reservoir"] = True
+            if "Manifold" in scatter_df.columns:
+                hover["Manifold"] = True
             if "Pattern" in scatter_df.columns:
                 hover["Pattern"] = True
 
@@ -686,7 +842,7 @@ with tabs[1]:
                 mid_x, mid_y = float(scatter_df["x"].median()), float(scatter_df["y"].median())
                 fig_sc.add_vline(x=mid_x, line_dash="dash", line_color="#8793A4", line_width=cfg.line_width)
                 fig_sc.add_hline(y=mid_y, line_dash="dash", line_color="#8793A4", line_width=cfg.line_width)
-                st.caption(f"Quadrants use the selected {display_level.lower()} median: VoW = {mid_x:,.3f}; Oil Supported = {mid_y:,.2f} {period_label}.")
+                st.caption(f"Quadrants use {display_level.lower()} medians: VoW = {mid_x:,.3f}; Oil Supported = {mid_y:,.2f} {'mbd' if oil_axis.startswith('Average') else period_label}.")
             if trendline and len(scatter_df) >= 3 and scatter_df["x"].nunique() > 1:
                 slope, offset = np.polyfit(scatter_df["x"], scatter_df["y"], 1)
                 xs = np.linspace(scatter_df["x"].min(), scatter_df["x"].max(), 100)
@@ -697,7 +853,7 @@ with tabs[1]:
                 fig_sc.add_trace(go.Scatter(x=to_label["x"], y=to_label["y"], mode="text", text=to_label["Point"],
                                              textposition="top center", textfont=dict(size=max(9, cfg.tick_size - 1), color=cfg.text),
                                              showlegend=False, hoverinfo="skip", cliponaxis=False))
-            apply_style(fig_sc, cfg, f"{custom_title} — {display_level}", x_caption, f"Oil Supported ({period_label})", show_legend=show_category_legend)
+            apply_style(fig_sc, cfg, f"{custom_title} — {display_level}", x_caption, y_caption, show_legend=show_category_legend)
             if st.checkbox("Set manual X/Y axis ranges", False, key="manual_scatter_axes"):
                 min_x, max_x = float(scatter_df["x"].min()), float(scatter_df["x"].max())
                 min_y, max_y = float(scatter_df["y"].min()), float(scatter_df["y"].max())
@@ -720,7 +876,7 @@ with tabs[1]:
             st.download_button("Download cross-plot as interactive HTML", fig_sc.to_html(full_html=True, include_plotlyjs=True).encode("utf-8"),
                                file_name=f"VoW_vs_OilSupported_{plot_level}_ColorBy_{color_by}.html", mime="text/html", key="html_cross")
             # True weighted aggregation: sum(supported) / sum(injected). Not average of ratios.
-            st.caption("Pattern and CPS VoW are recalculated from the respective **sum of supported oil / sum of injection**. Unit and monthly-average switches do not alter this technical ratio.")
+            st.caption("VoW at Pattern, CPS and Manifold level is calculated as **sum of Oil Supported / sum of Water Injection**. VoW > 2 can occur when supported oil volume exceeds injected-water volume; this ratio is not an incremental-oil recovery factor. Daily rate and volume unit choices do not alter VoW.")
 
 with tabs[2]:
     st.subheader("Pattern-by-Pattern ranking")
@@ -746,7 +902,7 @@ with tabs[2]:
         plot(chart, "pattern_ranking_bar")
     else:
         st.info("No Patterns satisfy the chosen injected-volume threshold.")
-    table = ranking[["Rank", "Pattern", "CPS", "Reservoir", "VoW Technical",
+    table = ranking[["Rank", "Pattern", "CPS", "Reservoir", "Manifold", "VoW Technical",
                      "Supported Display", "Oil Display", "Water Display", "Injection Display", "Watercut", "VRR", "Res Pressure", "FBHP Trend"]].copy()
     table = table.rename(columns={"Supported Display": f"Supported ({period_label})", "Oil Display": f"Oil ({period_label})",
                                   "Water Display": f"Produced Water ({period_label})", "Injection Display": f"Injected Water ({period_label})",
@@ -777,6 +933,28 @@ with tabs[3]:
     st.caption("**CPS technical VoW = total supported oil in that CPS / total injected water in that CPS**, including every selected Pattern. Do not use a simple average of Pattern efficiencies.")
 
 with tabs[4]:
+    st.subheader("Manifold-by-Manifold ranking")
+    if manifold.empty:
+        st.info("No Manifold data are assigned. Use the Manifold mapping control above to import an approved Pattern → Manifold table or fill it manually.")
+    else:
+        st.caption(f"Mapped Pattern rows: {len(mapped_work):,} of {len(work):,}. **Unmapped rows are excluded only from Manifold analysis**, not CPS / Pattern calculations.")
+        rankman = valid_manifold.sort_values("VoW Technical", ascending=False).reset_index(drop=True)
+        if not rankman.empty:
+            rankman["CPS–Manifold"] = rankman["CPS"] + " / " + rankman["Manifold"]
+            plotman = rankman.sort_values("VoW Technical")
+            figman = go.Figure(go.Bar(x=plotman["VoW Technical"], y=plotman["CPS–Manifold"],
+                                     orientation="h", marker_color=[cps_colors.get(c, "#789") for c in plotman["CPS"]],
+                                     text=plotman["VoW Technical"].map(lambda v: f"{v:.3f}"), textposition="outside"))
+            apply_style(figman, cfg, "Manifold ranking — weighted by injected water", "Value of Water (stb/stb)",
+                        "CPS / Manifold", show_legend=False, height=max(480, min(1600, len(plotman)*33 + 180)))
+            plot(figman, "manifold_ranking")
+            st.dataframe(rankman[["CPS", "Manifold", "Patterns", "VoW Technical", "Supported mbd", "Injection mbd",
+                                    "Supported Display", "Injection Display", "Watercut"]],
+                         use_container_width=True, hide_index=True)
+        else:
+            st.warning("Manifold assignments were found, but no mapped Manifolds have valid positive injection and supported-oil volumes.")
+
+with tabs[5]:
     st.subheader("Surveillance & diagnostic plots")
     obs1, obs2 = st.columns(2)
     with obs1:
@@ -847,12 +1025,13 @@ with tabs[4]:
         st.info("These X and Y variables have no overlapping non-empty observations.")
     st.caption("Pressure data are missing for some Patterns; these are dropped from pressure plots only. Supplied VRR is not recalculated from stock-tank volumes.")
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Source data, QC & calculation guideline")
-    qc_col1, qc_col2, qc_col3 = st.columns(3)
+    qc_col1, qc_col2, qc_col3, qc_col4 = st.columns(4)
     qc_col1.metric("Original selected records", len(filtered))
     qc_col2.metric("Zero-injection records", int(filtered["Injection"].eq(0).sum()))
     qc_col3.metric("Unparsed / corrected CPS names", int(filtered["CPS QC"].ne("").sum()))
+    qc_col4.metric("Manifold unmapped rows", int(filtered["Manifold"].eq("Unmapped").sum()))
     if not qc_table.empty:
         with st.expander(f"QC exceptions ({len(qc_table)} flags)", expanded=False):
             st.dataframe(qc_table, use_container_width=True, hide_index=True, height=300)
@@ -870,10 +1049,28 @@ with tabs[5]:
     st.markdown("**3. Roll up to CPS properly.**")
     st.latex(r"\mathrm{VoW}_{\mathrm{CPS}}=\frac{\sum_{p\in\mathrm{CPS}} Q_{o,\mathrm{supported},p}}{\sum_{p\in\mathrm{CPS}} W_{\mathrm{inj},p}}")
     st.markdown("**Do not average the Pattern VoW ratios directly.** Summing volumes first avoids bias toward low-injection Patterns.")
-    st.markdown("**4. Total versus monthly average.**")
+    st.markdown("**4. Why can Value of Water exceed 2 (or even 4)?**")
+    st.latex(r"\mathrm{VoW}=\frac{\mathrm{Oil\ Supported}}{\mathrm{Injected\ Water}}=\frac{432{,}000\ \mathrm{stb}}{100{,}000\ \mathrm{stb}}=4.32")
+    st.markdown("VoW is a **ratio of two reported volumes**, not a percent, recovery factor, or bound between 0 and 1. "
+                "Values above 2 are mathematically possible whenever reported Oil Supported is more than twice the injected-water volume over the same period. "
+                "The oil may include pre-existing production, natural drive, pressure support from outside this Pattern, and a time-lagged response to earlier injection. "
+                "Large values therefore warrant checking injection / production allocations, mismatched periods and zero / low injection — not automatic deletion.")
+    high_vow = valid_pat.loc[valid_pat["VoW Technical"].gt(2)].sort_values("VoW Technical", ascending=False)
+    st.caption(f"Current selection: {len(high_vow)} Patterns with Value of Water > 2.")
+    if not high_vow.empty:
+        st.dataframe(high_vow[["Pattern", "CPS", "Reservoir", "Manifold", "Supported", "Injection", "VoW Technical", "Supported mbd"]],
+                     use_container_width=True, hide_index=True)
+    st.markdown("**5. CPS and Manifold aggregation.**")
+    st.latex(r"\mathrm{VoW}_{\mathrm{CPS,Manifold}}=\frac{\sum_{p \in (\mathrm{CPS,Manifold})} Q_{o,\mathrm{supported},p}}{\sum_{p \in (\mathrm{CPS,Manifold})} W_{\mathrm{inj},p}}")
+    st.markdown("Manifold data come only from an explicit uploaded column or Pattern → Manifold mapping. "
+                "Manifold grouping uses **CPS + Manifold**, so identical manifold names at different CPS are not combined. Unmapped Patterns remain in CPS totals but not Manifold comparisons. "
+                "A Pattern spanning multiple Manifolds requires a defensible split of both oil and injection in the source; assigning full volumes twice would overcount.")
+    st.markdown("**6. Total, monthly average and daily rate (mbd).**")
     st.latex(r"Q_{\mathrm{avg/month}}=\frac{Q_{\mathrm{total\ period}}}{N_{\mathrm{months}}},\qquad\frac{Q_{o}/N}{W_{\mathrm{inj}}/N}=\frac{Q_o}{W_{\mathrm{inj}}}")
-    st.markdown("Unit conversions are applied equally to oil and water; changing volume display units or averaging per month must **not** change technical VoW.")
-    st.markdown("**5. Watercut and VRR.** Watercut is recomputed as produced water / (produced oil + produced water). Reported VRR is read from the workbook. Reservoir-corrected VRR requires FVF and full reservoir voidage terms, so we do **not** fabricate CPS reservoir VRR from stock-tank volumes.")
+    st.latex(r"Q_{\mathrm{avg,day}}[\mathrm{mbd}]=\frac{Q_{\mathrm{total}}[\mathrm{stb}]}{N_{\mathrm{days}}\times1000}")
+    st.markdown(f"Current daily-rate denominator: **{n_days:,} days**. Oil Supported on the VoW cross-plot defaults to **mbd** (thousand stb/day), independently of the global display. "
+                "Use the actual reporting-period day count. All rates and unit changes leave the VoW ratio unchanged.")
+    st.markdown("**7. Watercut and VRR.** Watercut is recomputed as produced water / (produced oil + produced water). Reported VRR is read from the workbook. Reservoir-corrected VRR requires FVF and full reservoir voidage terms, so we do **not** fabricate CPS reservoir VRR from stock-tank volumes.")
     if not valid_pat.empty:
         sample = valid_pat.iloc[0]
         st.markdown("**Worked example from the current filters:**")
@@ -890,6 +1087,9 @@ pattern_export = pat.sort_values("VoW Technical", ascending=False, na_position="
 pattern_export.insert(0, "Rank (technical VoW)", [i + 1 if pd.notna(v) else np.nan for i, v in enumerate(pattern_export["VoW Technical"])])
 cps_export = cps.sort_values("VoW Technical", ascending=False, na_position="last").reset_index(drop=True)
 cps_export.insert(0, "Rank (technical VoW)", [i + 1 if pd.notna(v) else np.nan for i, v in enumerate(cps_export["VoW Technical"])])
+manifold_export = manifold.sort_values("VoW Technical", ascending=False, na_position="last").reset_index(drop=True) if not manifold.empty else pd.DataFrame(columns=["CPS", "Manifold", "Patterns", "VoW Technical", "Supported mbd", "Injection mbd"])
+if not manifold_export.empty:
+    manifold_export.insert(0, "Rank (VoW)", [i + 1 if pd.notna(v) else np.nan for i, v in enumerate(manifold_export["VoW Technical"])])
 ex1, ex2, ex3 = st.columns(3)
 with ex1:
     st.download_button("Download Pattern Ranking CSV", pattern_export.to_csv(index=False).encode("utf-8-sig"),
@@ -899,10 +1099,13 @@ with ex2:
                        file_name="CPS_VoW_Ranking.csv", mime="text/csv", use_container_width=True)
 with ex3:
     try:
-        xlsx_bytes = file_download_excel(pattern_export, cps_export, work, qc_table, method, n_months, share, exclude_zero_supported)
+        xlsx_bytes = file_download_excel(pattern_export, cps_export, manifold_export, work, qc_table, method, n_months, n_days, share, exclude_zero_supported)
         st.download_button("Download Full Excel + QC + Guideline", xlsx_bytes,
                            file_name="Pattern_Waterflood_VoW_Analysis.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
     except Exception as exc:
         st.error(f"Excel export failed: {exc}")
-st.caption("Source workbook is read in memory for the current Streamlit session. Do not commit confidential field datasets to a public GitHub repository.")
+if not manifold_export.empty:
+    st.download_button("Download Manifold Ranking CSV", manifold_export.to_csv(index=False).encode("utf-8-sig"),
+                       file_name="Manifold_VoW_Ranking.csv", mime="text/csv", use_container_width=True)
+st.caption("Source workbook and optional Manifold mapping are read in memory for the current Streamlit session. Do not commit confidential field datasets to a public GitHub repository.")
