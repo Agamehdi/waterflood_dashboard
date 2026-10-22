@@ -523,7 +523,7 @@ def file_download_excel(patterns: pd.DataFrame, cps: pd.DataFrame, manifold: pd.
         ("Pattern normalization reference (stb/stb)", f"{norm_references['Pattern']:.8f}"),
         ("CPS normalization reference (stb/stb)", f"{norm_references['CPS']:.8f}"),
         ("Manifold normalization reference (stb/stb)", f"{norm_references['Manifold']:.8f}"),
-        ("Cross-plot breakdowns", "If a color option changes the actual point granularity (e.g. CPS x Reservoir), its plotted ratios are normalized by the maximum among THOSE displayed points. The displayed group is stated on the chart."),
+        ("Cross-plot breakdowns", "X-axis can show uploaded injected-water period volume, actual injected-water average mbd, or normalised VoW. Colour / bubble sizing may show VoW. If a color option changes point granularity (e.g. CPS x Reservoir), normalisation uses the maximum among those displayed points."),
         ("Normalization warning", "0–1 VoW is a relative score, NOT stb/stb and not the physically observed injection-to-oil ratio."),
         ("Aggregate VoW", "Ratio of sums, never an average of pattern VoW ratios."),
         ("Zero injection", "VoW is blank / undefined, not zero; retained in QC."),
@@ -902,7 +902,7 @@ with tabs[0]:
     apply_style(grouped, cfg, "Produced oil, produced water & injected water — by CPS", "CPS", f"Volume ({period_label})")
     plot(grouped, "overview_cps_volumes")
 
-    left, right = st.columns(2)
+    left, middle, right = st.columns(3)
     with left:
         wc = go.Figure()
         wc.add_trace(go.Bar(x=cps["CPS"], y=cps["Watercut"] * 100,
@@ -911,27 +911,64 @@ with tabs[0]:
         apply_style(wc, cfg, "Produced water cut — by CPS", "CPS", "Water cut (%)", show_legend=False, height=480)
         wc.update_yaxes(rangemode="tozero")
         plot(wc, "overview_watercut")
-    with right:
+    with middle:
         cw = go.Figure()
-        cw.add_trace(go.Bar(x=cps["CPS"], y=cps["Supported Display"], name="Oil Supported", marker_color=supported_color))
+        cw.add_trace(go.Bar(x=cps["CPS"], y=cps["Supported Display"], name="Oil Supported", marker_color=supported_color,
+                            text=cps["Supported Display"].map(lambda v: f"{v:,.1f}" if pd.notna(v) else ""), textposition="outside"))
         apply_style(cw, cfg, "Oil Supported — by CPS", "CPS", f"Oil Supported ({period_label})", show_legend=False, height=480)
+        cw.update_yaxes(rangemode="tozero")
         plot(cw, "overview_oil_supported")
-    st.caption("Volumes are aggregated by CPS from the Pattern names. Water cut is recomputed from total produced water / (total oil + total water), not averaged across Patterns.")
+    with right:
+        # Actual injected-water RATE derived from the uploaded full-period volume.
+        # It deliberately does not depend on the global total/month/day display unit.
+        injection_rate = go.Figure()
+        injection_rate.add_trace(go.Bar(
+            x=cps["CPS"], y=cps["Injection mbd"], name="Actual Water Injection",
+            marker_color=injection_color,
+            text=cps["Injection mbd"].map(lambda v: f"{v:,.1f}" if pd.notna(v) else ""),
+            textposition="outside",
+            customdata=cps[["Injection"]].to_numpy(),
+            hovertemplate="%{x}<br>Actual injection rate: %{y:,.2f} mbd"
+                          "<br>Injected volume: %{customdata[0]:,.0f} stb / period<extra></extra>",
+        ))
+        apply_style(injection_rate, cfg, "Actual water injection rate — by CPS", "CPS",
+                    "Actual injection rate (mbd)", show_legend=False, height=480)
+        injection_rate.update_yaxes(rangemode="tozero")
+        plot(injection_rate, "overview_actual_injection_rate")
+    st.caption(
+        "Volumes are aggregated by CPS from the Pattern names. Water cut is recomputed from produced water / "
+        "(produced oil + produced water). Actual injection rate = uploaded injected-water volume / "
+        f"{n_days:,} reporting days / 1,000 (mbd = thousand stb/day). It is not a time-resolved injection trend."
+    )
 
 with tabs[1]:
-    st.subheader("Value of Water vs Oil Supported")
+    st.subheader("Water Injection vs Oil Supported | VoW bubble / colour analytics")
     a, b, c, d = st.columns(4)
     with a:
         plot_level = st.radio("Aggregation", ["Pattern", "CPS", "Manifold"], horizontal=True, key="cross_level")
     with b:
-        color_by = st.selectbox("Color by", ["CPS", "Reservoir", "Pattern", "Manifold"], key="cross_color_by")
-    with c:
-        bubble_mode = st.selectbox("Marker sizing", ["Fixed", "Injected Water", "Oil Supported"], key="cross_bubble")
-    with d:
-        show_dot_labels = st.checkbox(
-            "Show labels on scatter dots", value=False, key="cross_show_dot_labels",
-            help="Switch the Point / CPS / Manifold names on or off directly on the chart. Hover labels always remain available.",
+        x_metric = st.selectbox(
+            "Cross-plot X-axis",
+            ["Injected Water (period volume)", "Actual Injection Rate (mbd)", "VoW (normalised 0–1)"],
+            index=0, key="cross_x_metric",
+            help="Injection volume is the original uploaded period total in Mstb; rate divides by the reporting days. Original VoW X-axis remains available.",
         )
+    with c:
+        color_by = st.selectbox(
+            "Color by", ["VoW (normalised 0–1)", "CPS", "Reservoir", "Pattern", "Manifold"],
+            key="cross_color_by",
+            help="Continuous colour scale for VoW or discrete colours for CPS, Reservoir, Pattern, and Manifold.",
+        )
+    with d:
+        bubble_mode = st.selectbox(
+            "Bubble size", ["Fixed", "VoW (normalised 0–1)", "Injected Water", "Oil Supported"],
+            key="cross_bubble",
+            help="Select VoW to size bubbles by the 0–1 score, or retain volume-based / fixed sizes.",
+        )
+    show_dot_labels = st.checkbox(
+        "Show labels on scatter dots", value=False, key="cross_show_dot_labels",
+        help="Toggle Pattern / CPS / Manifold labels; hover tooltips always remain available.",
+    )
 
     # The selected aggregation determines the useful default: all CPS and
     # Manifold labels, but only the highest 10 Pattern points to avoid overlap.
@@ -961,16 +998,25 @@ with tabs[1]:
     with opts_b:
         trendline = st.checkbox("Show linear trend line", False)
     with opts_c:
-        show_category_legend = st.checkbox("Show category legend", value=color_by != "Pattern", key=f"cross_show_legend_{color_by}")
+        if color_by == "VoW (normalised 0–1)":
+            show_category_legend = st.checkbox("Show VoW colour scale", value=True, key="cross_show_vow_colourbar")
+        else:
+            show_category_legend = st.checkbox("Show category legend", value=color_by != "Pattern", key=f"cross_show_legend_{color_by}")
 
     oil_axis = st.radio("Cross-plot Oil Supported Y-axis", ["Average per day (mbd)", "Follow global volume setting"],
                         index=0, horizontal=True, key="cross_y_unit",
                         help="Default: supported oil (stb) / days in uploaded period / 1000. The X-axis VoW is unchanged.")
     y_caption = "Oil Supported (mbd)" if oil_axis.startswith("Average") else f"Oil Supported ({period_label})"
-    # Stable colors independent of filtering. CPS retains the editable sidebar colors.
+    # Stable categorical colors; for VoW, a genuine continuous 0–1 colorbar.
     palette_name = "Plotly"
+    continuous_palette = "Viridis"
     custom_color = {}
-    if color_by != "CPS":
+    if color_by == "VoW (normalised 0–1)":
+        continuous_palette = st.selectbox(
+            "VoW colour gradient", ["Viridis", "Turbo", "Cividis", "Plasma", "YlGnBu", "RdYlGn"],
+            key="cross_vow_gradient",
+        )
+    elif color_by != "CPS":
         palette_name = st.selectbox("Color palette", ["Plotly", "Safe", "Bold", "Dark24", "Alphabet", "Pastel", "Set3"], key="cross_palette")
         if color_by == "Reservoir":
             with st.expander("Reservoir colors (custom)"):
@@ -978,7 +1024,7 @@ with tabs[1]:
                     pcols = getattr(px.colors.qualitative, palette_name)
                     custom_color[res_name] = st.color_picker(res_name, pcols[idx % len(pcols)], key=f"cross_res_color_{idx}")
 
-    custom_title = st.text_input("Cross-plot chart title", "Value of Water vs Oil Supported", key="cross_title")
+    custom_title = st.text_input("Cross-plot chart title", "Water Injection vs Oil Supported", key="cross_title")
     display_level = plot_level
     if plot_level == "Pattern":
         scatter_df = valid_pat.copy()
@@ -1027,7 +1073,17 @@ with tabs[1]:
         # own plotted group maximum so there is exactly one 1.000 point.
         scatter_norm_reference = vow_normalization_reference(scatter_df)
         scatter_df = normalise_vow(scatter_df, scatter_norm_reference)
-        scatter_df["x"] = scatter_df[x_field]
+        if x_metric == "Injected Water (period volume)":
+            # One constant unit for this axis, even if global display is monthly or daily.
+            # This prevents a misleading 'period volume' label on monthly/day rates.
+            scatter_df["x"] = scatter_df["Injection"] / 1_000.0
+            x_axis_caption = "Injected Water (Mstb / period)"
+        elif x_metric == "Actual Injection Rate (mbd)":
+            scatter_df["x"] = scatter_df["Injection mbd"]
+            x_axis_caption = "Actual water injection rate (mbd)"
+        else:
+            scatter_df["x"] = scatter_df[x_field]
+            x_axis_caption = x_caption
         scatter_df["y"] = scatter_df["Supported mbd"] if oil_axis.startswith("Average") else scatter_df["Supported Display"]
         scatter_df = scatter_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["x", "y"])
         if "Pattern" in scatter_df.columns:
@@ -1042,10 +1098,14 @@ with tabs[1]:
             scatter_df["Point"] = scatter_df["CPS"]
         scatter_df["Bubble"] = (scatter_df["Injection Display"] if bubble_mode == "Injected Water"
                                 else scatter_df["Supported Display"] if bubble_mode == "Oil Supported"
-                                else pd.Series([1] * len(scatter_df), index=scatter_df.index))
+                                # A small floor ensures near-zero VoW still leaves a visible dot.
+                                else 0.12 + 0.88 * scatter_df["VoW Normalized"] if bubble_mode == "VoW (normalised 0–1)"
+                                else pd.Series(1.0, index=scatter_df.index))
         scatter_df["Bubble"] = scatter_df["Bubble"].clip(lower=0).fillna(0)
         scatter_df["Water cut (%)"] = scatter_df["Watercut"] * 100
         scatter_df["Injected Water"] = scatter_df["Injection Display"]
+        scatter_df["Injection (Mstb / period)"] = scatter_df["Injection"] / 1_000.0
+        scatter_df["Injection rate (mbd)"] = scatter_df["Injection mbd"]
         scatter_df["Oil Supported"] = scatter_df["y"]
         scatter_df["Oil Supported (mbd)"] = scatter_df["Supported mbd"]
         scatter_df["Raw VoW (stb/stb)"] = scatter_df["VoW Technical"]
@@ -1071,7 +1131,9 @@ with tabs[1]:
         if scatter_df.empty:
             st.info("No valid numerical points after filtering.")
         else:
-            if color_by == "CPS":
+            if color_by == "VoW (normalised 0–1)":
+                color_map = {}
+            elif color_by == "CPS":
                 color_map = cps_colors
             elif color_by == "Reservoir":
                 color_map = custom_color
@@ -1085,8 +1147,9 @@ with tabs[1]:
                 patterns_all = sorted(df["Pattern"].dropna().astype(str).unique().tolist())
                 color_map = {name: palette[i % len(palette)] for i, name in enumerate(patterns_all)}
 
-            hover = {"CPS": True, "Injected Water": ":,.2f", "Oil Supported": ":,.2f",
-                     "Oil Supported (mbd)": ":,.2f",
+            hover = {"CPS": True, "Injected Water": ":,.2f",
+                     "Injection (Mstb / period)": ":,.2f", "Injection rate (mbd)": ":,.2f",
+                     "Oil Supported": ":,.2f", "Oil Supported (mbd)": ":,.2f",
                      "Raw VoW (stb/stb)": ":.4f", "Normalised VoW (0–1)": ":.4f", "Water cut (%)": ":.1f",
                      "x": False, "y": False, "Bubble": False}
             if "Reservoir" in scatter_df.columns:
@@ -1096,10 +1159,16 @@ with tabs[1]:
             if "Pattern" in scatter_df.columns:
                 hover["Pattern"] = True
 
+            vow_colour = color_by == "VoW (normalised 0–1)"
             fig_sc = px.scatter(
-                scatter_df, x="x", y="y", color=color_by, size="Bubble", size_max=cfg.marker_size,
+                scatter_df, x="x", y="y",
+                color="VoW Normalized" if vow_colour else color_by,
+                size="Bubble", size_max=cfg.marker_size,
                 text="Dot label" if show_dot_labels else None,
-                hover_name="Point", color_discrete_map=color_map, hover_data=hover,
+                hover_name="Point", color_discrete_map=None if vow_colour else color_map,
+                color_continuous_scale=continuous_palette if vow_colour else None,
+                range_color=[0, 1] if vow_colour else None,
+                hover_data=hover,
                 category_orders={"CPS": sorted(df["CPS"].unique(), key=cps_sort)},
             )
             fig_sc.update_traces(marker=dict(opacity=cfg.opacity, line=dict(width=max(0.5, cfg.line_width / 2), color=cfg.paper)))
@@ -1114,23 +1183,42 @@ with tabs[1]:
                 mid_x, mid_y = float(scatter_df["x"].median()), float(scatter_df["y"].median())
                 fig_sc.add_vline(x=mid_x, line_dash="dash", line_color="#8793A4", line_width=cfg.line_width)
                 fig_sc.add_hline(y=mid_y, line_dash="dash", line_color="#8793A4", line_width=cfg.line_width)
-                st.caption(f"Quadrants use {display_level.lower()} medians: normalised VoW = {mid_x:,.3f}; Oil Supported = {mid_y:,.2f} {'mbd' if oil_axis.startswith('Average') else period_label}.")
+                st.caption(f"Quadrants use {display_level.lower()} medians: {x_axis_caption} = {mid_x:,.3f}; Oil Supported = {mid_y:,.2f} {'mbd' if oil_axis.startswith('Average') else period_label}.")
             if trendline and len(scatter_df) >= 3 and scatter_df["x"].nunique() > 1:
                 slope, offset = np.polyfit(scatter_df["x"], scatter_df["y"], 1)
                 xs = np.linspace(scatter_df["x"].min(), scatter_df["x"].max(), 100)
                 fig_sc.add_trace(go.Scatter(x=xs, y=slope * xs + offset, mode="lines", name="OLS trend",
                                              line=dict(color="#D64E60", width=cfg.line_width + 1, dash="dot"), hoverinfo="skip"))
-            apply_style(fig_sc, cfg, f"{custom_title} — {display_level}", x_caption, y_caption, show_legend=show_category_legend)
+            apply_style(fig_sc, cfg, f"{custom_title} — {display_level}", x_axis_caption, y_caption,
+                        show_legend=show_category_legend and not vow_colour)
+            if vow_colour:
+                # Continuous colors are represented by a colorbar, not a categorical legend.
+                fig_sc.update_coloraxes(
+                    showscale=show_category_legend,
+                    colorbar=dict(title=dict(text="VoW (0–1)", side="right"),
+                                  thickness=15, len=0.75, y=0.48),
+                )
+                if show_category_legend:
+                    fig_sc.update_layout(margin_r=135)
             manual_scatter_axes = st.checkbox("Set manual X/Y axis ranges", False, key="manual_scatter_axes")
             if manual_scatter_axes:
                 min_x, max_x = float(scatter_df["x"].min()), float(scatter_df["x"].max())
                 min_y, max_y = float(scatter_df["y"].min()), float(scatter_df["y"].max())
                 pad_x, pad_y = max((max_x - min_x) * 0.08, 0.01), max((max_y - min_y) * 0.08, 0.01)
                 xx1, xx2, yy1, yy2 = st.columns(4)
+                vow_x = x_metric == "VoW (normalised 0–1)"
                 with xx1:
-                    lo_x = st.number_input("X minimum", min_value=0.0, max_value=1.0, value=max(0.0,min_x-pad_x), format="%.4f", key="x_axis_min")
+                    lo_x = st.number_input(
+                        "X minimum", min_value=0.0,
+                        value=max(0.0, min_x - pad_x),
+                        format="%.4f" if vow_x else "%.2f", key=f"x_axis_min_{keyify(x_metric)}",
+                    )
                 with xx2:
-                    hi_x = st.number_input("X maximum", min_value=0.0, max_value=1.0, value=min(1.0,max_x+pad_x), format="%.4f", key="x_axis_max")
+                    hi_x = st.number_input(
+                        "X maximum", min_value=0.0,
+                        value=min(1.0, max_x + pad_x) if vow_x else max_x + pad_x,
+                        format="%.4f" if vow_x else "%.2f", key=f"x_axis_max_{keyify(x_metric)}",
+                    )
                 with yy1:
                     lo_y = st.number_input("Y minimum", value=min_y - pad_y, format="%.2f", key="y_axis_min")
                 with yy2:
@@ -1141,18 +1229,29 @@ with tabs[1]:
                 else:
                     st.warning("Axis maximum must be greater than minimum.")
             if not manual_scatter_axes:
-                fig_sc.update_xaxes(range=[0, 1], tick0=0, dtick=0.2)
-            plot(fig_sc, f"vow_scatter_{plot_level.lower()}_{color_by.lower()}")
+                if x_metric == "VoW (normalised 0–1)":
+                    fig_sc.update_xaxes(range=[0, 1], tick0=0, dtick=0.2)
+                else:
+                    fig_sc.update_xaxes(rangemode="tozero")
+            plot(fig_sc, f"vow_scatter_{keyify(x_metric)}_{plot_level.lower()}_{keyify(color_by)}")
             st.download_button("Download cross-plot as interactive HTML", fig_sc.to_html(full_html=True, include_plotlyjs=True).encode("utf-8"),
-                               file_name=f"VoW_vs_OilSupported_{plot_level}_ColorBy_{color_by}.html", mime="text/html", key="html_cross")
+                               file_name=f"WaterInjection_OilSupported_{keyify(x_metric)}_{plot_level}_ColorBy_{keyify(color_by)}.html",
+                               mime="text/html", key="html_cross")
+            cross_export_columns = ["Point", "CPS", "Injection (Mstb / period)", "Injection rate (mbd)",
+                                    "Oil Supported (mbd)", "Raw VoW (stb/stb)", "Normalised VoW (0–1)"]
+            cross_export_columns += [c for c in ("Reservoir", "Manifold", "Pattern") if c in scatter_df.columns]
+            st.download_button("Download current cross-plot data (CSV)",
+                               scatter_df[cross_export_columns].to_csv(index=False).encode("utf-8-sig"),
+                               file_name="Water_Injection_vs_Oil_Supported_Crossplot.csv",
+                               mime="text/csv", key="cross_export_csv")
             # True weighted aggregation: sum(supported) / sum(injected). Not average of ratios.
             st.caption(
-                f"VoW (0–1) for **{display_level}** = raw VoW ÷ **{scatter_norm_reference:.3f} stb/stb**, "
-                "the highest raw ratio **among the points shown on this plot**. "
-                "Changing Aggregation refreshes the reference. If Color by creates a "
-                "CPS × Reservoir or other detailed breakdown, the plot shows and scales "
-                "that actual breakdown (not unsplit CPS totals). "
-                "Original ratios remain in hover and exports."
+                f"**X-axis:** {x_axis_caption}; **Y-axis:** {y_caption}. "
+                f"VoW (0–1) for **{display_level}** = raw VoW ÷ **{scatter_norm_reference:.3f} stb/stb** "
+                "(maximum across the plotted groups). Bubble size and continuous colour can independently "
+                "represent normalised VoW; true raw VoW is available in the hover and CSV. "
+                "Changing Aggregation or using detailed Reservoir/Manifold groups recalculates the VoW reference. "
+                "Volumes/rates describe the uploaded reporting period and do not prove causal injection response."
             )
 
 with tabs[2]:
@@ -1405,8 +1504,9 @@ with tabs[6]:
     st.markdown("**6. Total, monthly average and daily rate (mbd).**")
     st.latex(r"Q_{\mathrm{avg/month}}=\frac{Q_{\mathrm{total\ period}}}{N_{\mathrm{months}}},\qquad\frac{Q_{o}/N}{W_{\mathrm{inj}}/N}=\frac{Q_o}{W_{\mathrm{inj}}}")
     st.latex(r"Q_{\mathrm{avg,day}}[\mathrm{mbd}]=\frac{Q_{\mathrm{total}}[\mathrm{stb}]}{N_{\mathrm{days}}\times1000}")
-    st.markdown(f"Current daily-rate denominator: **{n_days:,} days**. Oil Supported on the VoW cross-plot defaults to **mbd** (thousand stb/day), independently of the global display. "
-                "Use the actual reporting-period day count. All rates and unit changes leave the VoW ratio unchanged.")
+    st.markdown(f"Current daily-rate denominator: **{n_days:,} days**. Oil Supported on the cross-plot defaults to **mbd** (thousand stb/day), independently of the global display. "
+                "Choose injected-water period total (Mstb), actual average injection rate (mbd), or the original 0–1 VoW on the X-axis. "
+                "Bubble size or colour can each indicate VoW. Use actual reporting-period days; display units leave VoW unchanged.")
     st.markdown("**7. Watercut and VRR.** Watercut is recomputed as produced water / (produced oil + produced water). Reported VRR is read from the workbook. Reservoir-corrected VRR requires FVF and full reservoir voidage terms, so we do **not** fabricate CPS reservoir VRR from stock-tank volumes.")
     if not valid_pat.empty:
         sample = valid_pat.iloc[0]
