@@ -496,6 +496,60 @@ def plot(fig: go.Figure, key: str):
                     config={"displaylogo": False, "scrollZoom": False, "toImageButtonOptions": {"format": "png", "filename": key, "scale": 2}})
 
 
+def add_secondary_vow_axis(fig: go.Figure, points: pd.DataFrame, design: Design,
+                           metric: str, series_style: str, colour: str) -> go.Figure:
+    """Overlay independent VoW observations on a *true* right-hand Plotly Y-axis.
+
+    The primary Oil Supported bubbles and their colour axis remain untouched.
+    Both axes use the same X positions and the same displayed grouping level.
+    """
+    normalised = metric == "Normalised VoW (0–1)"
+    series_col = "VoW Normalized" if normalised else "VoW Technical"
+    observed = points.replace([np.inf, -np.inf], np.nan).dropna(subset=["x", series_col]).copy()
+    if observed.empty:
+        return fig
+
+    # Joining unrelated CPS / Manifolds can be misleading: don't connect by default.
+    # If the user explicitly selects a connecting line, order by ascending injection X.
+    lines = series_style == "Markers + dotted line (X order)"
+    if lines:
+        observed = observed.sort_values("x")
+
+    label = "VoW (normalised 0–1)" if normalised else "VoW (raw stb/stb)"
+    raw_vals = pd.to_numeric(observed[series_col], errors="coerce")
+    y_limit = 1.05 if normalised else max(0.01, float(raw_vals.max()) * 1.12)
+
+    fig.add_trace(go.Scatter(
+        x=observed["x"], y=observed[series_col],
+        yaxis="y2", name=f"{label} — right axis",
+        mode="lines+markers" if lines else "markers",
+        marker=dict(symbol="diamond-open", size=max(11, design.marker_size * 0.65),
+                    color=colour, line=dict(color=colour, width=2)),
+        line=dict(color=colour, width=design.line_width, dash="dot"),
+        customdata=observed[["Point", "Raw VoW (stb/stb)",
+                             "Normalised VoW (0–1)", "Injection rate (mbd)",
+                             "Oil Supported (mbd)"]].to_numpy(),
+        hovertemplate=("<b>%{customdata[0]}</b><br>Right-axis VoW: %{y:.4f}"
+                       "<br>Raw VoW: %{customdata[1]:.4f} stb/stb"
+                       "<br>Normalised VoW: %{customdata[2]:.4f}"
+                       "<br>Water Injection: %{customdata[3]:,.2f} mbd"
+                       "<br>Oil Supported: %{customdata[4]:,.2f} mbd"
+                       "<extra>Secondary VoW</extra>"),
+        showlegend=True,
+    ))
+    fig.update_layout(yaxis2=dict(
+        title=dict(text=label, font=dict(color=colour, size=design.axis_size), standoff=15),
+        overlaying="y", side="right", anchor="x", range=[0, y_limit],
+        showgrid=False, zeroline=False, showline=True, linecolor=colour,
+        tickfont=dict(size=design.tick_size, color=colour), tickformat=".2f",
+        ticks="outside", automargin=True,
+    ))
+    # Reserve two independent spaces on the right: one for Y2 and another for
+    # the original VoW colour scale (handled below by update_coloraxes).
+    fig.update_layout(margin_r=315)
+    return fig
+
+
 def scale_volume(x: pd.Series, factor: float, months: float, monthly: bool) -> pd.Series:
     return x * factor / (months if monthly else 1)
 
@@ -1007,6 +1061,36 @@ with tabs[1]:
                         index=0, horizontal=True, key="cross_y_unit",
                         help="Default: supported oil (stb) / days in uploaded period / 1000. The X-axis VoW is unchanged.")
     y_caption = "Oil Supported (mbd)" if oil_axis.startswith("Average") else f"Oil Supported ({period_label})"
+    st.divider()
+    st.markdown("**Optional secondary Y-axis — Value of Water**")
+    secondary_enabled = st.checkbox(
+        "Show VoW on secondary Y-axis (right)", value=False, key="cross_secondary_vow",
+        help="Adds a separate right-hand VoW scale while retaining the primary Oil Supported bubbles and the colour scale."
+    )
+    secondary_metric = "Normalised VoW (0–1)"
+    secondary_style = "Open diamond markers"
+    secondary_colour = "#D14D41"
+    if secondary_enabled:
+        sy1, sy2, sy3 = st.columns([1.15, 1.4, 0.8])
+        with sy1:
+            secondary_metric = st.selectbox(
+                "Secondary VoW scale", ["Normalised VoW (0–1)", "Raw VoW (stb/stb)"],
+                key="cross_secondary_metric",
+                help="The raw ratio and its 0–1 normalisation represent different units. The bubble colour bar continues to show normalised VoW (0–1).",
+            )
+        with sy2:
+            secondary_style = st.selectbox(
+                "Secondary series appearance",
+                ["Open diamond markers", "Markers + dotted line (X order)"],
+                key="cross_secondary_style",
+            )
+        with sy3:
+            secondary_colour = st.color_picker(
+                "Secondary series colour", "#D14D41", key="cross_secondary_colour",
+            )
+        if secondary_style.startswith("Markers +"):
+            st.caption("Connecting line joins groups in X-axis order for visual reference only; it is not a time trend.")
+
     # Stable categorical colors; for VoW, a genuine continuous 0–1 colorbar.
     palette_name = "Plotly"
     continuous_palette = "Viridis"
@@ -1190,16 +1274,26 @@ with tabs[1]:
                 fig_sc.add_trace(go.Scatter(x=xs, y=slope * xs + offset, mode="lines", name="OLS trend",
                                              line=dict(color="#D64E60", width=cfg.line_width + 1, dash="dot"), hoverinfo="skip"))
             apply_style(fig_sc, cfg, f"{custom_title} — {display_level}", x_axis_caption, y_caption,
-                        show_legend=show_category_legend and not vow_colour)
+                        show_legend=(show_category_legend and not vow_colour) or secondary_enabled)
+            if secondary_enabled:
+                fig_sc = add_secondary_vow_axis(
+                    fig_sc, scatter_df, cfg, secondary_metric, secondary_style, secondary_colour,
+                )
             if vow_colour:
-                # Continuous colors are represented by a colorbar, not a categorical legend.
+                # Retain the original, independent 0–1 colour bar even when the
+                # right-hand Y2 axis is showing raw or normalised VoW.
                 fig_sc.update_coloraxes(
                     showscale=show_category_legend,
-                    colorbar=dict(title=dict(text="VoW (0–1)", side="right"),
-                                  thickness=15, len=0.75, y=0.48),
+                    colorbar=dict(
+                        title=dict(text="VoW colour (0–1)" if secondary_enabled else "VoW (0–1)", side="right"),
+                        thickness=15, len=0.72 if secondary_enabled else 0.75,
+                        y=0.49 if secondary_enabled else 0.48,
+                        x=1.15 if secondary_enabled else 1.02,
+                        xanchor="left",
+                    ),
                 )
                 if show_category_legend:
-                    fig_sc.update_layout(margin_r=135)
+                    fig_sc.update_layout(margin_r=315 if secondary_enabled else 145)
             manual_scatter_axes = st.checkbox("Set manual X/Y axis ranges", False, key="manual_scatter_axes")
             if manual_scatter_axes:
                 min_x, max_x = float(scatter_df["x"].min()), float(scatter_df["x"].max())
@@ -1225,7 +1319,7 @@ with tabs[1]:
                     hi_y = st.number_input("Y maximum", value=max_y + pad_y, format="%.2f", key="y_axis_max")
                 if lo_x < hi_x and lo_y < hi_y:
                     fig_sc.update_xaxes(range=[lo_x, hi_x])
-                    fig_sc.update_yaxes(range=[lo_y, hi_y])
+                    fig_sc.update_layout(yaxis_range=[lo_y, hi_y])  # Primary Y only: preserve VoW Y2 scale.
                 else:
                     st.warning("Axis maximum must be greater than minimum.")
             if not manual_scatter_axes:
@@ -1233,7 +1327,13 @@ with tabs[1]:
                     fig_sc.update_xaxes(range=[0, 1], tick0=0, dtick=0.2)
                 else:
                     fig_sc.update_xaxes(rangemode="tozero")
-            plot(fig_sc, f"vow_scatter_{keyify(x_metric)}_{plot_level.lower()}_{keyify(color_by)}")
+            if secondary_enabled:
+                st.caption(
+                    f"Secondary right-hand axis: **{secondary_metric}**, shown as open diamonds. "
+                    "The original Oil Supported bubbles remain on the left axis; the VoW "
+                    "colour scale remains a separate 0–1 reference when Color by VoW is selected."
+                )
+            plot(fig_sc, f"vow_scatter_{keyify(x_metric)}_{plot_level.lower()}_{keyify(color_by)}_{secondary_enabled}")
             st.download_button("Download cross-plot as interactive HTML", fig_sc.to_html(full_html=True, include_plotlyjs=True).encode("utf-8"),
                                file_name=f"WaterInjection_OilSupported_{keyify(x_metric)}_{plot_level}_ColorBy_{keyify(color_by)}.html",
                                mime="text/html", key="html_cross")
@@ -1246,7 +1346,7 @@ with tabs[1]:
                                mime="text/csv", key="cross_export_csv")
             # True weighted aggregation: sum(supported) / sum(injected). Not average of ratios.
             st.caption(
-                f"**X-axis:** {x_axis_caption}; **Y-axis:** {y_caption}. "
+                f"**X-axis:** {x_axis_caption}; **Left Y-axis:** {y_caption}. "
                 f"VoW (0–1) for **{display_level}** = raw VoW ÷ **{scatter_norm_reference:.3f} stb/stb** "
                 "(maximum across the plotted groups). Bubble size and continuous colour can independently "
                 "represent normalised VoW; true raw VoW is available in the hover and CSV. "
